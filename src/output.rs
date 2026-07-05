@@ -18,6 +18,20 @@ pub fn current(flag_json: bool) -> Mode {
     decide(flag_json, env_json, std::io::stdout().is_terminal())
 }
 
+pub fn humanize_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -40,5 +54,23 @@ mod tests {
     #[test]
     fn test_tty_no_flags_is_human() {
         assert_eq!(decide(false, false, true), Mode::Human);
+    }
+
+    #[test]
+    fn test_humanize_bytes_stays_in_b_below_1024() {
+        assert_eq!(humanize_bytes(0), "0 B");
+        assert_eq!(humanize_bytes(500), "500 B");
+    }
+
+    #[test]
+    fn test_humanize_bytes_switches_to_kib() {
+        assert_eq!(humanize_bytes(1024), "1.0 KiB");
+        assert_eq!(humanize_bytes(1536), "1.5 KiB");
+    }
+
+    #[test]
+    fn test_humanize_bytes_switches_to_mib_and_gib() {
+        assert_eq!(humanize_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(humanize_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
     }
 }

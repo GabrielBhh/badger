@@ -3,6 +3,9 @@ use clap::CommandFactory;
 
 use crate::cli::{Cli, Command, WhitelistAction};
 
+pub mod history;
+pub mod whitelist;
+
 pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Completion { shell } => {
@@ -11,16 +14,36 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
             Ok(())
         }
-        Command::History { run: _ } => {
-            bail!("`badger history` is not implemented yet — coming in a later phase")
+        Command::History { run } => {
+            let ctx = crate::ctx::Ctx::resolve(
+                cli.dry_run,
+                cli.debug,
+                crate::ctx::EnvOverrides::from_process(),
+            )?;
+            let mode = crate::output::current(cli.json);
+            history::run(&ctx.state_dir, run.as_deref(), mode)
         }
-        Command::Whitelist { action } => match action {
-            WhitelistAction::Add { pattern: _ }
-            | WhitelistAction::Remove { pattern: _ }
-            | WhitelistAction::List => {
-                bail!("`badger whitelist` is not implemented yet — coming in a later phase")
+        Command::Whitelist { action } => {
+            let ctx = crate::ctx::Ctx::resolve(
+                cli.dry_run,
+                cli.debug,
+                crate::ctx::EnvOverrides::from_process(),
+            )?;
+            match action {
+                WhitelistAction::List => {
+                    println!("{}", whitelist::list(&ctx.config_dir)?);
+                    Ok(())
+                }
+                WhitelistAction::Add { pattern } => {
+                    println!("{}", whitelist::add(&ctx.config_dir, &pattern)?);
+                    Ok(())
+                }
+                WhitelistAction::Remove { pattern } => {
+                    println!("{}", whitelist::remove(&ctx.config_dir, &pattern)?);
+                    Ok(())
+                }
             }
-        },
+        }
         Command::Helper => {
             bail!("`badger __helper` must be invoked by badger itself")
         }
