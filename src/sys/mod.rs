@@ -4,3 +4,5 @@
 //! convention `analyze::disk` established.
 
 pub mod cpu;
+pub mod mem;
+pub mod psi;
