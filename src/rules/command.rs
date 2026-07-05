@@ -102,7 +102,9 @@ fn pacman_orphans_detector(ctx: &Ctx, _config: &Config) -> Vec<Candidate> {
 /// Parses `pacman -Qi`'s "Name" / "Installed Size" fields into a
 /// name -> bytes map. Tolerant of formatting quirks: an entry whose size
 /// can't be parsed is simply omitted (the caller falls back to "unknown").
-fn parse_pacman_installed_sizes(text: &str) -> HashMap<String, u64> {
+/// `pub(crate)`: also reused by `pkg::pacman::list` to size installed
+/// packages for `badger uninstall`'s picker.
+pub(crate) fn parse_pacman_installed_sizes(text: &str) -> HashMap<String, u64> {
     let mut out = HashMap::new();
     let mut current_name: Option<String> = None;
     for line in text.lines() {

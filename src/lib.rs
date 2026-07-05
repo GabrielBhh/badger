@@ -4,6 +4,7 @@ pub mod config;
 pub mod core;
 pub mod ctx;
 pub mod output;
+pub mod pkg;
 pub mod privilege;
 pub mod purge;
 pub mod rules;
