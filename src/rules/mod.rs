@@ -44,6 +44,11 @@ pub enum Action {
     /// Run one or more external commands instead of deleting paths
     /// ourselves; the rule's candidates are informational sizing only.
     Cmd(fn(&Ctx, &Config) -> Vec<CmdSpec>),
+    /// Like `Cmd`, but the command is built from exactly the candidates the
+    /// person selected in this group (e.g. `pacman -Rns <ticked packages>`).
+    /// Never invoked with an empty selection — nothing selected means no
+    /// command runs at all.
+    CmdSelected(fn(&Ctx, &Config, &[Candidate]) -> Vec<CmdSpec>),
 }
 
 pub struct Rule {

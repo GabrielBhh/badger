@@ -55,7 +55,7 @@ fn scan_rule(
     let raw = raw_candidates(rule, ctx, config);
     let (candidates, skipped) = match rule.action {
         Action::DeletePaths => finish_deletable_candidates(rule, raw, ctx, whitelist, env),
-        Action::Cmd(_) => (size_only(raw), Vec::new()),
+        Action::Cmd(_) | Action::CmdSelected(_) => (size_only(raw), Vec::new()),
     };
 
     Group {
