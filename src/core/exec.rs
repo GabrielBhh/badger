@@ -179,6 +179,8 @@ impl Effector for RealEffector<'_> {
 
         let manifest = privilege::Manifest {
             run_id: run_id.to_string(),
+            root: self.ctx.root.clone(),
+            home: self.ctx.home.clone(),
             ops: ops
                 .iter()
                 .map(|op| privilege::HelperOp {

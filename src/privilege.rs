@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-use crate::rules::{expand_path_spec_parts, registry};
-use crate::safety::protected::{SafetyEnv, Tier, validate_deletable};
+use crate::rules::{Rule, expand_path_spec_parts, registry};
+use crate::safety::protected::{SafetyEnv, Tier, parse_mountinfo, validate_deletable};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HelperOp {
@@ -19,6 +19,12 @@ pub struct HelperOp {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Manifest {
     pub run_id: String,
+    /// The parent's resolved root/home, carried across the `sudo` boundary so
+    /// the helper re-validates against the invoking user's paths rather than
+    /// trusting its own (root-owned) process environment — see
+    /// `safety_env_from_manifest`.
+    pub root: PathBuf,
+    pub home: PathBuf,
     pub ops: Vec<HelperOp>,
 }
 
@@ -35,7 +41,7 @@ pub struct HelperResult {
 /// now (closing the TOCTOU window between selection and root-side
 /// execution), and the path must still pass `validate_deletable` for its
 /// owning rule's allowed prefixes.
-pub fn helper_validate_op(op: &HelperOp, env: &SafetyEnv) -> Result<(), String> {
+pub fn helper_validate_op(op: &HelperOp, rules: &[Rule], env: &SafetyEnv) -> Result<(), String> {
     let metadata = std::fs::symlink_metadata(&op.path)
         .map_err(|e| format!("cannot stat {}: {e}", op.path.display()))?;
     if metadata.dev() != op.expected_dev || metadata.ino() != op.expected_ino {
@@ -45,8 +51,8 @@ pub fn helper_validate_op(op: &HelperOp, env: &SafetyEnv) -> Result<(), String> 
         ));
     }
 
-    let rule = registry()
-        .into_iter()
+    let rule = rules
+        .iter()
         .find(|r| r.id == op.rule_id)
         .ok_or_else(|| format!("unknown rule id: {}", op.rule_id))?;
     let allowed: Vec<PathBuf> = rule
@@ -55,6 +61,22 @@ pub fn helper_validate_op(op: &HelperOp, env: &SafetyEnv) -> Result<(), String> 
         .map(|p| expand_path_spec_parts(p, &env.root, &env.home))
         .collect();
     validate_deletable(&op.path, &allowed, Tier::System, env).map_err(|r| r.to_string())
+}
+
+/// Builds the `SafetyEnv` the helper re-validates against, using the root/home
+/// carried in the manifest — never the helper process's own `$HOME`. `sudo`'s
+/// default `env_reset` sets `HOME=/root` for the child, which is not the
+/// invoking user's home; trusting it would check the home-relative deny list
+/// and depth guard against the wrong tree.
+fn safety_env_from_manifest(manifest: &Manifest) -> anyhow::Result<SafetyEnv> {
+    let text = std::fs::read_to_string("/proc/self/mountinfo")
+        .context("failed to read /proc/self/mountinfo")?;
+    Ok(SafetyEnv {
+        root: manifest.root.clone(),
+        home: manifest.home.clone(),
+        mount_points: parse_mountinfo(&text),
+        euid: nix::unistd::geteuid().as_raw(),
+    })
 }
 
 /// Reads a `Manifest` (one JSON object) from `stdin`, refuses unless running
@@ -73,11 +95,11 @@ pub fn helper_main<R: Read, W: Write>(mut stdin: R, mut stdout: W) -> anyhow::Re
         .context("failed to read manifest from stdin")?;
     let manifest: Manifest = serde_json::from_str(&text).context("failed to parse manifest")?;
 
-    let ctx = crate::ctx::Ctx::resolve(false, false, crate::ctx::EnvOverrides::from_process())?;
-    let env = SafetyEnv::from_system(&ctx)?;
+    let env = safety_env_from_manifest(&manifest)?;
+    let rules = registry();
 
     for op in &manifest.ops {
-        let result = match helper_validate_op(op, &env) {
+        let result = match helper_validate_op(op, &rules, &env) {
             Ok(()) => {
                 let report = crate::safety::deleter::delete_tree(&op.path);
                 if report.errors.is_empty() {
@@ -140,7 +162,9 @@ pub fn run_helper(manifest: &Manifest) -> anyhow::Result<Vec<HelperResult>> {
             .stdin
             .as_mut()
             .context("privileged helper's stdin was unavailable")?;
-        stdin.write_all(serde_json::to_string(manifest)?.as_bytes())?;
+        stdin
+            .write_all(serde_json::to_string(manifest)?.as_bytes())
+            .context("failed to write manifest to privileged helper's stdin")?;
     }
     let output = child
         .wait_with_output()
@@ -178,6 +202,8 @@ mod tests {
     fn test_manifest_serde_round_trips() {
         let manifest = Manifest {
             run_id: "run-1".to_string(),
+            root: PathBuf::from("/"),
+            home: PathBuf::from("/home/user"),
             ops: vec![HelperOp {
                 rule_id: "dev.pip".to_string(),
                 path: PathBuf::from("/home/user/.cache/pip"),
@@ -188,6 +214,45 @@ mod tests {
         let json = serde_json::to_string(&manifest).unwrap();
         let round_tripped: Manifest = serde_json::from_str(&json).unwrap();
         assert_eq!(manifest, round_tripped);
+    }
+
+    // Regression: helper_main used to build its SafetyEnv via
+    // Ctx::resolve(...) reading $HOME from the process env. Under `sudo`
+    // (default env_reset) that resolves to /root, not the invoking user's
+    // home, silently breaking the home-relative deny list (~/.ssh etc.) and
+    // depth check on the root side. safety_env_from_manifest must build the
+    // env from the manifest's carried root/home instead, never from $HOME.
+    #[test]
+    fn test_safety_env_from_manifest_uses_manifest_home_for_denylist_check() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let manifest_root = sandbox.path().join("root");
+        let manifest_home = manifest_root.join("home/realuser");
+        let ssh_key = manifest_home.join(".ssh/id_rsa");
+        std::fs::create_dir_all(manifest_home.join(".ssh")).unwrap();
+        std::fs::write(&ssh_key, b"secret").unwrap();
+
+        let manifest = Manifest {
+            run_id: "run-1".to_string(),
+            root: manifest_root.clone(),
+            home: manifest_home.clone(),
+            ops: Vec::new(),
+        };
+
+        let env = safety_env_from_manifest(&manifest).unwrap();
+        assert_eq!(env.home, manifest_home, "must use manifest home, not $HOME");
+
+        let metadata = std::fs::symlink_metadata(&ssh_key).unwrap();
+        let op = HelperOp {
+            rule_id: "user.thumbnails".to_string(),
+            path: ssh_key,
+            expected_dev: metadata.dev(),
+            expected_ino: metadata.ino(),
+        };
+        let err = helper_validate_op(&op, &registry(), &env).unwrap_err();
+        assert_eq!(
+            err,
+            crate::safety::protected::Refusal::DenyListed.to_string()
+        );
     }
 
     #[test]
@@ -207,7 +272,7 @@ mod tests {
         };
 
         let e = env(&root, &home);
-        let err = helper_validate_op(&op, &e).unwrap_err();
+        let err = helper_validate_op(&op, &registry(), &e).unwrap_err();
         assert!(err.contains("dev/ino mismatch"), "error was: {err}");
     }
 
@@ -229,7 +294,7 @@ mod tests {
         };
 
         let e = env(&root, &home);
-        let err = helper_validate_op(&op, &e).unwrap_err();
+        let err = helper_validate_op(&op, &registry(), &e).unwrap_err();
         assert_eq!(
             err,
             crate::safety::protected::Refusal::DenyListed.to_string()
@@ -253,7 +318,7 @@ mod tests {
         };
 
         let e = env(&root, &home);
-        assert_eq!(helper_validate_op(&op, &e), Ok(()));
+        assert_eq!(helper_validate_op(&op, &registry(), &e), Ok(()));
     }
 
     #[test]
@@ -272,7 +337,7 @@ mod tests {
         };
 
         let e = env(&root, &home);
-        let err = helper_validate_op(&op, &e).unwrap_err();
+        let err = helper_validate_op(&op, &registry(), &e).unwrap_err();
         assert!(err.contains("unknown rule id"), "error was: {err}");
     }
 }
