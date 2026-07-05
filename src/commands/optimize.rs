@@ -4,14 +4,14 @@
 //! but over `rules::optimize::rules()` instead of the deletion registry.
 //! Every task is `Action::Cmd` with a single, informational, zero-byte
 //! candidate — there is nothing to report in bytes freed, so the summary
-//! counts tasks run/skipped instead (see `count_task_outcomes`).
+//! counts tasks run/skipped instead (see `summarize_run`).
 
 use std::collections::HashSet;
 use std::io::IsTerminal;
 
 use serde::Serialize;
 
-use crate::commands::shared::{drive_selection, execution_notes};
+use crate::commands::shared::drive_selection;
 use crate::core::exec::{DryRunEffector, RealEffector, Summary, execute, execute_selected};
 use crate::core::item::{Group, Risk};
 use crate::core::runner::runner_for;
@@ -86,10 +86,10 @@ pub fn run(ctx: &Ctx, yes: bool, dry_run_flag: bool, mode: Mode) -> anyhow::Resu
         eprintln!("warning: {warning}");
     }
 
-    let (ran, skipped) = if will_execute {
-        count_task_outcomes(&journal, &run_id)?
+    let (ran, skipped, notes) = if will_execute {
+        summarize_run(&journal, &run_id)?
     } else {
-        (0, 0)
+        (0, 0, Vec::new())
     };
 
     let mut rendered = match mode {
@@ -101,7 +101,7 @@ pub fn run(ctx: &Ctx, yes: bool, dry_run_flag: bool, mode: Mode) -> anyhow::Resu
         Mode::Human => render_human(&groups, will_execute, is_dry_run, ran, skipped),
     };
     if will_execute && mode == Mode::Human {
-        for note in execution_notes(&journal, &run_id)? {
+        for note in notes {
             rendered.push_str(&format!("\n  {note}"));
         }
     }
@@ -184,7 +184,7 @@ fn render_after_selection(
         eprintln!("warning: {warning}");
     }
 
-    let (ran, skipped) = count_task_outcomes(journal, &run_id)?;
+    let (ran, skipped, notes) = summarize_run(journal, &run_id)?;
     let mut out = if dry_run {
         format!("Would run {ran} task(s) — dry run — nothing executed (recorded in history).")
     } else {
@@ -194,28 +194,35 @@ fn render_after_selection(
         out.push_str(&format!(" {skipped} skipped."));
     }
 
-    for note in execution_notes(journal, &run_id)? {
+    for note in notes {
         out.push_str(&format!("\n  {note}"));
     }
 
     Ok(OptimizeOutput { rendered: out })
 }
 
-/// How many of this run's journaled actions actually ran (or, in a dry run,
-/// would have) vs. were skipped (sudo in a sandbox). Errors/refusals count
-/// as neither — they show up via `execution_notes` instead.
-fn count_task_outcomes(journal: &Journal, run_id: &str) -> anyhow::Result<(usize, usize)> {
+/// Reads this run's journal records once and classifies all of them: how
+/// many actually ran (or, in a dry run, would have), how many were skipped
+/// (sudo in a sandbox), and "note: <rule> — <outcome>" lines for the
+/// skipped/error/refused ones (same format as `commands::shared::
+/// execution_notes`, inlined here so both counts and notes come from a
+/// single journal read instead of two).
+fn summarize_run(journal: &Journal, run_id: &str) -> anyhow::Result<(usize, usize, Vec<String>)> {
     let (records, _) = journal.read_all()?;
     let mut ran = 0;
     let mut skipped = 0;
+    let mut notes = Vec::new();
     for record in records.iter().filter(|r| r.run_id == run_id) {
         if record.outcome.starts_with("skipped") {
             skipped += 1;
-        } else if !record.outcome.starts_with("error") && !record.outcome.starts_with("refused") {
+            notes.push(format!("note: {} — {}", record.rule, record.outcome));
+        } else if record.outcome.starts_with("error") || record.outcome.starts_with("refused") {
+            notes.push(format!("note: {} — {}", record.rule, record.outcome));
+        } else {
             ran += 1;
         }
     }
-    Ok((ran, skipped))
+    Ok((ran, skipped, notes))
 }
 
 fn render_human(
