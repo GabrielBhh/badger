@@ -4,6 +4,9 @@ use crate::config::Config;
 use crate::core::item::{Candidate, Risk};
 use crate::ctx::Ctx;
 
+pub mod dev;
+pub mod user;
+
 /// Whether a rule even makes sense to run in the current environment.
 #[derive(Debug, Clone, Copy)]
 pub enum Applicability {
@@ -71,7 +74,40 @@ pub fn expand_path_spec(spec: &str, ctx: &Ctx) -> PathBuf {
 }
 
 pub fn registry() -> Vec<Rule> {
-    Vec::new()
+    let mut rules = Vec::new();
+    rules.extend(user::rules());
+    rules.extend(dev::rules());
+    rules
+}
+
+/// Real `/proc/*/comm` scan, always live (no sandboxing awareness) so it can
+/// be exercised directly in tests against a spawned process.
+fn is_process_running(name: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let pid = entry.file_name();
+        if !pid.to_string_lossy().chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if let Ok(comm) = std::fs::read_to_string(entry.path().join("comm"))
+            && comm.trim() == name
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a process named `name` (exact `/proc/<pid>/comm` match) is
+/// currently running. Always false while `ctx.sandboxed`, since tests must
+/// never depend on — or be able to spoof — the real system's process table.
+pub fn process_running(name: &str, ctx: &Ctx) -> bool {
+    if ctx.sandboxed {
+        return false;
+    }
+    is_process_running(name)
 }
 
 #[cfg(test)]
@@ -117,7 +153,40 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_registry_compiles_and_is_empty_for_now() {
-        assert!(registry().is_empty());
+    fn test_registry_ids_are_unique() {
+        let rules = registry();
+        assert!(!rules.is_empty());
+        let mut ids: Vec<&str> = rules.iter().map(|r| r.id).collect();
+        ids.sort_unstable();
+        let mut deduped = ids.clone();
+        deduped.dedup();
+        assert_eq!(ids, deduped, "duplicate rule id in registry()");
+    }
+
+    #[test]
+    fn test_process_running_is_false_when_sandboxed_even_if_really_running() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("2")
+            .spawn()
+            .unwrap();
+        let c = ctx(PathBuf::from("/root"), PathBuf::from("/root/home/user"));
+        assert!(c.sandboxed);
+        assert!(!process_running("sleep", &c));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn test_process_running_detects_a_real_running_process() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("2")
+            .spawn()
+            .unwrap();
+        let mut c = ctx(PathBuf::from("/root"), PathBuf::from("/root/home/user"));
+        c.sandboxed = false;
+        assert!(process_running("sleep", &c));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!process_running("no-such-process-xyz", &c));
     }
 }
