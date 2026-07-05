@@ -6,6 +6,7 @@ use crate::ctx::Ctx;
 
 pub mod command;
 pub mod dev;
+pub mod leftovers;
 pub mod moderate;
 pub mod optimize;
 pub mod snap;
@@ -138,7 +139,13 @@ pub fn expand_path_spec_parts(
     }
 }
 
-pub fn registry() -> Vec<Rule> {
+/// Every rule the `clean` registry knows about. `experimental` rules
+/// (currently just `leftovers.orphan_configs`) are only appended when
+/// `experimental` is true — gating happens here, at registry level, rather
+/// than filtering candidates out later: a rule that never entered the
+/// registry can't be seen by plan rendering, the TUI, or the privileged
+/// helper, which is safer than any downstream check that could be missed.
+pub fn registry(experimental: bool) -> Vec<Rule> {
     let mut rules = Vec::new();
     rules.extend(user::rules());
     rules.extend(dev::rules());
@@ -146,6 +153,9 @@ pub fn registry() -> Vec<Rule> {
     rules.extend(moderate::rules());
     rules.extend(snap::rules());
     rules.extend(snapshots::rules());
+    if experimental {
+        rules.extend(leftovers::rules());
+    }
     rules
 }
 
@@ -224,13 +234,25 @@ mod tests {
 
     #[test]
     fn test_registry_ids_are_unique() {
-        let rules = registry();
+        let rules = registry(true);
         assert!(!rules.is_empty());
         let mut ids: Vec<&str> = rules.iter().map(|r| r.id).collect();
         ids.sort_unstable();
         let mut deduped = ids.clone();
         deduped.dedup();
         assert_eq!(ids, deduped, "duplicate rule id in registry()");
+    }
+
+    #[test]
+    fn test_registry_excludes_experimental_rules_by_default() {
+        let rules = registry(false);
+        assert!(!rules.iter().any(|r| r.id == "leftovers.orphan_configs"));
+    }
+
+    #[test]
+    fn test_registry_includes_experimental_rules_when_requested() {
+        let rules = registry(true);
+        assert!(rules.iter().any(|r| r.id == "leftovers.orphan_configs"));
     }
 
     #[test]

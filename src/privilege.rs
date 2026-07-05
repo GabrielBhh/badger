@@ -96,7 +96,10 @@ pub fn helper_main<R: Read, W: Write>(mut stdin: R, mut stdout: W) -> anyhow::Re
     let manifest: Manifest = serde_json::from_str(&text).context("failed to parse manifest")?;
 
     let env = safety_env_from_manifest(&manifest)?;
-    let rules = registry();
+    // Rules for ops already selected and validated upstream may include
+    // experimental ones — the helper only resolves rule ids to allowed
+    // prefixes, so it must know every rule that could have produced an op.
+    let rules = registry(true);
 
     for op in &manifest.ops {
         let result = match helper_validate_op(op, &rules, &env) {
@@ -248,7 +251,7 @@ mod tests {
             expected_dev: metadata.dev(),
             expected_ino: metadata.ino(),
         };
-        let err = helper_validate_op(&op, &registry(), &env).unwrap_err();
+        let err = helper_validate_op(&op, &registry(false), &env).unwrap_err();
         assert_eq!(
             err,
             crate::safety::protected::Refusal::DenyListed.to_string()
@@ -272,7 +275,7 @@ mod tests {
         };
 
         let e = env(&root, &home);
-        let err = helper_validate_op(&op, &registry(), &e).unwrap_err();
+        let err = helper_validate_op(&op, &registry(false), &e).unwrap_err();
         assert!(err.contains("dev/ino mismatch"), "error was: {err}");
     }
 
@@ -294,7 +297,7 @@ mod tests {
         };
 
         let e = env(&root, &home);
-        let err = helper_validate_op(&op, &registry(), &e).unwrap_err();
+        let err = helper_validate_op(&op, &registry(false), &e).unwrap_err();
         assert_eq!(
             err,
             crate::safety::protected::Refusal::DenyListed.to_string()
@@ -318,7 +321,7 @@ mod tests {
         };
 
         let e = env(&root, &home);
-        assert_eq!(helper_validate_op(&op, &registry(), &e), Ok(()));
+        assert_eq!(helper_validate_op(&op, &registry(false), &e), Ok(()));
     }
 
     #[test]
@@ -337,7 +340,7 @@ mod tests {
         };
 
         let e = env(&root, &home);
-        let err = helper_validate_op(&op, &registry(), &e).unwrap_err();
+        let err = helper_validate_op(&op, &registry(false), &e).unwrap_err();
         assert!(err.contains("unknown rule id"), "error was: {err}");
     }
 }

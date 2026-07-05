@@ -31,6 +31,9 @@ pub enum Command {
         /// Actually delete Safe-tier selections (default just plans)
         #[arg(long)]
         yes: bool,
+        /// Include experimental rules (orphaned config detection — may misidentify)
+        #[arg(long)]
+        experimental: bool,
     },
     /// Uninstall unused packages
     Uninstall,

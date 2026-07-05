@@ -17,15 +17,21 @@ pub struct CleanOutput {
     pub rendered: String,
 }
 
-pub fn run(ctx: &Ctx, yes: bool, dry_run_flag: bool, mode: Mode) -> anyhow::Result<CleanOutput> {
+pub fn run(
+    ctx: &Ctx,
+    yes: bool,
+    dry_run_flag: bool,
+    mode: Mode,
+    experimental: bool,
+) -> anyhow::Result<CleanOutput> {
     // Non-tty/--json/--yes behavior (below) is unchanged; the checklist only
     // shows up for a real, interactive `badger clean` with neither flag.
     if mode == Mode::Human && !yes && std::io::stderr().is_terminal() {
-        return run_interactive(ctx, dry_run_flag);
+        return run_interactive(ctx, dry_run_flag, experimental);
     }
 
     let whitelist = Whitelist::load(&ctx.config_dir, &ctx.home)?;
-    let rules = rules::registry();
+    let rules = rules::registry(experimental);
     let groups = scan(&rules, ctx, &ctx.config, &whitelist)?;
 
     // --dry-run always wins over --yes: never risk a real delete on a preview request.
@@ -90,9 +96,13 @@ pub fn run(ctx: &Ctx, yes: bool, dry_run_flag: bool, mode: Mode) -> anyhow::Resu
 
 /// Interactive `badger clean`: scan, show the checklist and risk-scaled
 /// confirmation, then execute exactly what was selected.
-fn run_interactive(ctx: &Ctx, dry_run_flag: bool) -> anyhow::Result<CleanOutput> {
+fn run_interactive(
+    ctx: &Ctx,
+    dry_run_flag: bool,
+    experimental: bool,
+) -> anyhow::Result<CleanOutput> {
     let whitelist = Whitelist::load(&ctx.config_dir, &ctx.home)?;
-    let rules = rules::registry();
+    let rules = rules::registry(experimental);
     let groups = scan(&rules, ctx, &ctx.config, &whitelist)?;
 
     if !groups
@@ -579,7 +589,7 @@ mod tests {
         // scan time, so it's exactly the kind of note this fix must surface.
         ctx.available_commands = Some(vec!["paccache".to_string()]);
 
-        let output = run(&ctx, true, false, Mode::Human).unwrap();
+        let output = run(&ctx, true, false, Mode::Human, false).unwrap();
 
         assert!(
             output.rendered.contains("note:"),

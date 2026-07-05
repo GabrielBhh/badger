@@ -43,7 +43,7 @@ fn test_default_plan_shows_candidate_and_does_not_touch_journal_or_filesystem() 
     let f = fixture();
     let dir = thumbnails_dir(&f.ctx);
 
-    let output = clean::run(&f.ctx, false, false, Mode::Human).unwrap();
+    let output = clean::run(&f.ctx, false, false, Mode::Human, false).unwrap();
 
     assert!(output.rendered.contains("Thumbnail cache"));
     assert!(output.rendered.contains("[safe]"));
@@ -59,7 +59,7 @@ fn test_dry_run_journals_and_leaves_filesystem_untouched() {
     let f = fixture();
     let dir = thumbnails_dir(&f.ctx);
 
-    let output = clean::run(&f.ctx, false, true, Mode::Human).unwrap();
+    let output = clean::run(&f.ctx, false, true, Mode::Human, false).unwrap();
 
     assert!(output.rendered.contains("Would free 4.0 KiB"));
     assert!(output.rendered.contains("dry run"));
@@ -77,7 +77,7 @@ fn test_yes_deletes_selected_candidate_and_journals_real_run() {
     let f = fixture();
     let dir = thumbnails_dir(&f.ctx);
 
-    let output = clean::run(&f.ctx, true, false, Mode::Human).unwrap();
+    let output = clean::run(&f.ctx, true, false, Mode::Human, false).unwrap();
 
     assert!(output.rendered.contains("Freed 4.0 KiB"));
     assert!(!dir.exists(), "--yes must actually delete the candidate");
@@ -94,7 +94,7 @@ fn test_dry_run_wins_over_yes() {
     let f = fixture();
     let dir = thumbnails_dir(&f.ctx);
 
-    let output = clean::run(&f.ctx, true, true, Mode::Human).unwrap();
+    let output = clean::run(&f.ctx, true, true, Mode::Human, false).unwrap();
 
     assert!(output.rendered.contains("dry run"));
     assert!(dir.exists(), "--dry-run must win over --yes");
@@ -109,7 +109,7 @@ fn test_moderate_group_is_shown_but_never_executed_by_yes() {
     let mut ctx = f.ctx.clone();
     ctx.available_commands = Some(vec!["journalctl".to_string()]);
 
-    let output = clean::run(&ctx, true, false, Mode::Human).unwrap();
+    let output = clean::run(&ctx, true, false, Mode::Human, false).unwrap();
 
     assert!(output.rendered.contains("systemd journal"));
     assert!(output.rendered.contains("needs manual opt-in"));
@@ -121,7 +121,7 @@ fn test_json_mode_emits_parseable_groups_and_summary() {
     let f = fixture();
     thumbnails_dir(&f.ctx);
 
-    let output = clean::run(&f.ctx, true, false, Mode::Json).unwrap();
+    let output = clean::run(&f.ctx, true, false, Mode::Json, false).unwrap();
 
     let value: serde_json::Value = serde_json::from_str(&output.rendered).unwrap();
     assert!(value["groups"].is_array());
@@ -131,7 +131,7 @@ fn test_json_mode_emits_parseable_groups_and_summary() {
 #[test]
 fn test_nothing_to_clean_on_an_empty_home() {
     let f = fixture();
-    let output = clean::run(&f.ctx, false, false, Mode::Human).unwrap();
+    let output = clean::run(&f.ctx, false, false, Mode::Human, false).unwrap();
     assert_eq!(output.rendered, "Nothing to clean.");
 }
 

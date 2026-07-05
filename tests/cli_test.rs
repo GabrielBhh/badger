@@ -11,6 +11,21 @@ fn test_parses_clean_subcommand() {
 }
 
 #[test]
+fn test_parses_clean_experimental_flag() {
+    let cli = parse(&["badger", "clean", "--experimental"]).unwrap();
+    match cli.command {
+        badger::cli::Command::Clean { experimental, .. } => assert!(experimental),
+        _ => panic!("expected Clean"),
+    }
+
+    let cli = parse(&["badger", "clean"]).unwrap();
+    match cli.command {
+        badger::cli::Command::Clean { experimental, .. } => assert!(!experimental),
+        _ => panic!("expected Clean"),
+    }
+}
+
+#[test]
 fn test_parses_uninstall_subcommand() {
     assert!(parse(&["badger", "uninstall"]).is_ok());
 }
