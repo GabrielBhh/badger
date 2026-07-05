@@ -84,20 +84,25 @@ fn package_matches(installed: &HashSet<String>, name: &str) -> bool {
 }
 
 /// `pacman -Qq`, one installed package name per line. Returns `None` if the
-/// command errors or fails — condition 1 (no installed-package evidence)
-/// must fail closed: no package knowledge means no guesses at all, so the
-/// whole detector bails out to zero candidates.
+/// command errors, fails, or succeeds with zero package names — a real Arch
+/// system always has packages installed, so an empty result is itself a
+/// signal that something's wrong (not a system with nothing on it) and must
+/// fail closed exactly like the error path: condition 1 (no installed-package
+/// evidence) means no guesses at all, so the whole detector bails out to zero
+/// candidates.
 fn installed_pacman_names(ctx: &Ctx) -> Option<HashSet<String>> {
     let runner = runner_for(ctx);
     let argv = vec!["pacman".to_string(), "-Qq".to_string()];
     match runner.run(&argv) {
-        Ok(out) if out.success => Some(
-            out.stdout
+        Ok(out) if out.success => {
+            let names: HashSet<String> = out
+                .stdout
                 .lines()
                 .map(|l| l.trim().to_lowercase())
                 .filter(|l| !l.is_empty())
-                .collect(),
-        ),
+                .collect();
+            if names.is_empty() { None } else { Some(names) }
+        }
         _ => None,
     }
 }
@@ -434,6 +439,17 @@ mod tests {
         aged_dir(&f.ctx, ".config", "oldapp", 200);
         let mut ctx = f.ctx;
         ctx.fake_command_output = Some(HashMap::new());
+
+        let candidates = orphan_configs_detector(&ctx, &ctx.config.clone());
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_pacman_success_with_empty_stdout_yields_zero_candidates_fail_closed() {
+        let f = fixture();
+        aged_dir(&f.ctx, ".config", "oldapp", 200);
+        let mut ctx = f.ctx;
+        ctx.fake_command_output = Some(HashMap::from([(pacman_qq_argv(), cmd_output(""))]));
 
         let candidates = orphan_configs_detector(&ctx, &ctx.config.clone());
         assert!(candidates.is_empty());
