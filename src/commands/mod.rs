@@ -55,7 +55,13 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 crate::ctx::EnvOverrides::from_process(),
             )?;
             let mode = crate::output::current(cli.json);
-            println!("{}", clean::run(&ctx, yes, cli.dry_run, mode)?.rendered);
+            let output = clean::run(&ctx, yes, cli.dry_run, mode)?;
+            // Interactive cancel prints its own "nothing cleaned" note to
+            // stderr and returns nothing to render — don't add a blank
+            // stdout line on top of it.
+            if !output.rendered.is_empty() {
+                println!("{}", output.rendered);
+            }
             Ok(())
         }
         Command::Uninstall => {

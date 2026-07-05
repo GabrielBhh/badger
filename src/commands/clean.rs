@@ -1,6 +1,10 @@
+use std::collections::HashSet;
+use std::io::IsTerminal;
+
+use crossterm::event::{Event, KeyEventKind};
 use serde::Serialize;
 
-use crate::core::exec::{DryRunEffector, RealEffector, Summary, execute};
+use crate::core::exec::{DryRunEffector, RealEffector, Summary, execute, execute_selected};
 use crate::core::item::{Group, Risk};
 use crate::core::runner::RealRunner;
 use crate::core::scan::scan;
@@ -9,6 +13,7 @@ use crate::output::{Mode, humanize_bytes};
 use crate::rules::{self, Action, Rule};
 use crate::safety::journal::Journal;
 use crate::safety::whitelist::Whitelist;
+use crate::tui::{self, checklist, confirm};
 
 pub struct CleanOutput {
     pub rendered: String,
@@ -22,6 +27,12 @@ struct JsonOutput<'a> {
 }
 
 pub fn run(ctx: &Ctx, yes: bool, dry_run_flag: bool, mode: Mode) -> anyhow::Result<CleanOutput> {
+    // Non-tty/--json/--yes behavior (below) is unchanged; the checklist only
+    // shows up for a real, interactive `badger clean` with neither flag.
+    if mode == Mode::Human && !yes && std::io::stderr().is_terminal() {
+        return run_interactive(ctx, dry_run_flag);
+    }
+
     let whitelist = Whitelist::load(&ctx.config_dir, &ctx.home)?;
     let rules = rules::registry();
     let groups = scan(&rules, ctx, &ctx.config, &whitelist)?;
@@ -71,6 +82,155 @@ pub fn run(ctx: &Ctx, yes: bool, dry_run_flag: bool, mode: Mode) -> anyhow::Resu
         Mode::Human => render_human(&groups, &rules, summary.as_ref(), will_execute, is_dry_run),
     };
     Ok(CleanOutput { rendered })
+}
+
+/// Interactive `badger clean`: scan, show the checklist and risk-scaled
+/// confirmation, then execute exactly what was selected.
+fn run_interactive(ctx: &Ctx, dry_run_flag: bool) -> anyhow::Result<CleanOutput> {
+    let whitelist = Whitelist::load(&ctx.config_dir, &ctx.home)?;
+    let rules = rules::registry();
+    let groups = scan(&rules, ctx, &ctx.config, &whitelist)?;
+
+    if !groups
+        .iter()
+        .any(|g| !g.candidates.is_empty() || !g.skipped.is_empty())
+    {
+        return Ok(CleanOutput {
+            rendered: "Nothing to clean.".to_string(),
+        });
+    }
+
+    let mut terminal = tui::init_terminal()?;
+    let selection_result = drive_selection(&mut terminal, groups.clone());
+    // Leave the alternate screen before anything else happens: a sudo
+    // prompt (during execution below) and the final summary (printed by our
+    // caller once we return) both need a normal, scrollable terminal.
+    tui::restore_terminal(&mut terminal)?;
+
+    let Some(selection) = selection_result? else {
+        eprintln!("nothing cleaned");
+        return Ok(CleanOutput {
+            rendered: String::new(),
+        });
+    };
+
+    let journal = Journal::new(&ctx.state_dir);
+    render_after_selection(&groups, &selection, &rules, ctx, &journal, dry_run_flag)
+}
+
+/// Drives the checklist -> confirm key-handling loop against a real
+/// terminal. Returns the confirmed selection, or `None` if the person
+/// cancelled from the checklist.
+fn drive_selection(
+    terminal: &mut tui::Term,
+    groups: Vec<Group>,
+) -> anyhow::Result<Option<HashSet<(usize, usize)>>> {
+    let mut state = checklist::ChecklistState::new(groups);
+    let mut confirming: Option<confirm::ConfirmState> = None;
+    let colors = tui::colors_enabled_now();
+
+    loop {
+        let height = terminal.size()?.height;
+        if let Some(confirm_state) = &confirming {
+            terminal.draw(|f| confirm::render(f, confirm_state))?;
+        } else {
+            state.scroll_into_view(checklist::body_height(height));
+            terminal.draw(|f| checklist::render(f, &state, colors))?;
+        }
+
+        let Event::Key(key) = crossterm::event::read()? else {
+            continue;
+        };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+
+        if let Some(confirm_state) = &mut confirming {
+            match confirm::handle_key(confirm_state, key) {
+                confirm::Outcome::Proceed => return Ok(Some(state.selection().clone())),
+                confirm::Outcome::Back => confirming = None,
+                confirm::Outcome::None => {}
+            }
+            continue;
+        }
+
+        match checklist::map_key(key) {
+            Some(checklist::Action::Down) => state.move_down(),
+            Some(checklist::Action::Up) => state.move_up(),
+            Some(checklist::Action::Toggle) => state.toggle(),
+            Some(checklist::Action::ToggleGroup) => state.toggle_group(),
+            Some(checklist::Action::Top) => state.top(),
+            Some(checklist::Action::Bottom) => state.bottom(),
+            Some(checklist::Action::Cancel) => return Ok(None),
+            Some(checklist::Action::Confirm) => {
+                confirming = Some(confirm::ConfirmState::from_checklist(&state));
+            }
+            None => {}
+        }
+    }
+}
+
+/// The terminal-free seam: given a scan's groups and an already-made
+/// selection (as the checklist would produce), executes it and renders the
+/// final summary. No terminal involved, so tests drive scan -> selection ->
+/// execute directly.
+fn render_after_selection(
+    groups: &[Group],
+    selection: &HashSet<(usize, usize)>,
+    rules: &[Rule],
+    ctx: &Ctx,
+    journal: &Journal,
+    dry_run: bool,
+) -> anyhow::Result<CleanOutput> {
+    let run_id = jiff::Timestamp::now().to_string();
+    let summary = if dry_run {
+        let mut effector = DryRunEffector;
+        execute_selected(
+            groups,
+            selection,
+            rules,
+            ctx,
+            &ctx.config,
+            &mut effector,
+            journal,
+            &run_id,
+            true,
+        )?
+    } else {
+        let mut effector = RealEffector::new(ctx, Box::new(RealRunner));
+        execute_selected(
+            groups,
+            selection,
+            rules,
+            ctx,
+            &ctx.config,
+            &mut effector,
+            journal,
+            &run_id,
+            false,
+        )?
+    };
+
+    let mut out = if dry_run {
+        format!(
+            "Would free {} — dry run — nothing deleted (recorded in history).",
+            humanize_bytes(summary.bytes_freed)
+        )
+    } else {
+        format!("Freed {}.", humanize_bytes(summary.bytes_freed))
+    };
+
+    let (records, _) = journal.read_all()?;
+    for record in records.iter().filter(|r| r.run_id == run_id) {
+        if record.outcome.starts_with("skipped")
+            || record.outcome.starts_with("error")
+            || record.outcome.starts_with("refused")
+        {
+            out.push_str(&format!("\n  note: {} — {}", record.rule, record.outcome));
+        }
+    }
+
+    Ok(CleanOutput { rendered: out })
 }
 
 fn render_human(
@@ -308,5 +468,149 @@ mod tests {
         let out = render_plan(&[group], &[safe_delete_rule("pacman.sync_partial", true)]);
         assert!(out.contains("needs root file deletion"));
         assert!(out.contains("Would free: 0 B"));
+    }
+
+    // --- render_after_selection: the terminal-free seam behind the TUI ---
+
+    struct ExecFixture {
+        _sandbox: tempfile::TempDir,
+        ctx: Ctx,
+    }
+
+    fn exec_fixture() -> ExecFixture {
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path().join("root");
+        let home = root.join("home/user");
+        std::fs::create_dir_all(&home).unwrap();
+        let ctx = Ctx {
+            root,
+            home,
+            config_dir: sandbox.path().join("config"),
+            state_dir: sandbox.path().join("state"),
+            dry_run: false,
+            debug: false,
+            config: crate::config::Config::default(),
+            sandboxed: true,
+            available_commands: None,
+        };
+        ExecFixture {
+            _sandbox: sandbox,
+            ctx,
+        }
+    }
+
+    fn delete_rule_with_prefix(
+        id: &'static str,
+        requires_sudo: bool,
+        allowed_prefixes: &'static [&'static str],
+    ) -> Rule {
+        Rule {
+            id,
+            title: "test rule",
+            risk: Risk::Safe,
+            requires_sudo,
+            applicable: Applicability::Always,
+            allowed_prefixes,
+            detector: Detector::Globs(&[]),
+            action: Action::DeletePaths,
+            notes: "",
+        }
+    }
+
+    fn group_with_one_candidate(rule_id: &str, path: PathBuf, bytes: u64, risk: Risk) -> Group {
+        Group {
+            rule_id: rule_id.to_string(),
+            title: "test group".to_string(),
+            risk,
+            requires_sudo: false,
+            candidates: vec![Candidate::new(
+                Some(path),
+                "test candidate".to_string(),
+                bytes,
+                risk,
+            )],
+            skipped: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_render_after_selection_executes_only_the_selected_candidate() {
+        let f = exec_fixture();
+        let target = f.ctx.home.join(".cache/target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("f.txt"), vec![0u8; 4096]).unwrap();
+
+        let rule = delete_rule_with_prefix("test.rule", false, &["~/.cache/target"]);
+        let group = group_with_one_candidate("test.rule", target.clone(), 4096, Risk::Safe);
+        let journal = Journal::new(&f.ctx.state_dir);
+        let selection = HashSet::from([(0usize, 0usize)]);
+
+        let output =
+            render_after_selection(&[group], &selection, &[rule], &f.ctx, &journal, false).unwrap();
+
+        assert_eq!(output.rendered, "Freed 4.0 KiB.");
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn test_render_after_selection_executes_a_selected_moderate_candidate() {
+        let f = exec_fixture();
+        let target = f.ctx.home.join(".cache/target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("f.txt"), vec![0u8; 4096]).unwrap();
+
+        let rule = delete_rule_with_prefix("test.moderate", false, &["~/.cache/target"]);
+        let group = group_with_one_candidate("test.moderate", target.clone(), 4096, Risk::Moderate);
+        let journal = Journal::new(&f.ctx.state_dir);
+        let selection = HashSet::from([(0usize, 0usize)]);
+
+        let output =
+            render_after_selection(&[group], &selection, &[rule], &f.ctx, &journal, false).unwrap();
+
+        assert_eq!(output.rendered, "Freed 4.0 KiB.");
+        assert!(
+            !target.exists(),
+            "a selected Moderate candidate must actually execute via the TUI path"
+        );
+    }
+
+    #[test]
+    fn test_render_after_selection_dry_run_leaves_filesystem_untouched() {
+        let f = exec_fixture();
+        let target = f.ctx.home.join(".cache/target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("f.txt"), vec![0u8; 2048]).unwrap();
+
+        let rule = delete_rule_with_prefix("test.rule", false, &["~/.cache/target"]);
+        let group = group_with_one_candidate("test.rule", target.clone(), 2048, Risk::Safe);
+        let journal = Journal::new(&f.ctx.state_dir);
+        let selection = HashSet::from([(0usize, 0usize)]);
+
+        let output =
+            render_after_selection(&[group], &selection, &[rule], &f.ctx, &journal, true).unwrap();
+
+        assert!(output.rendered.contains("dry run — nothing deleted"));
+        assert!(target.exists(), "dry run must not delete anything");
+    }
+
+    #[test]
+    fn test_render_after_selection_surfaces_a_sandboxed_sudo_skip_as_a_note() {
+        let f = exec_fixture();
+        let target = f.ctx.root.join("var/cache/target");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let rule = delete_rule_with_prefix("test.sudo_rule", true, &["/var/cache/target"]);
+        let mut group = group_with_one_candidate("test.sudo_rule", target.clone(), 512, Risk::Safe);
+        group.requires_sudo = true;
+        let journal = Journal::new(&f.ctx.state_dir);
+        let selection = HashSet::from([(0usize, 0usize)]);
+
+        let output =
+            render_after_selection(&[group], &selection, &[rule], &f.ctx, &journal, false).unwrap();
+
+        assert!(output.rendered.contains("Freed 0 B."));
+        assert!(output.rendered.contains("note:"));
+        assert!(output.rendered.contains("skipped"));
+        assert!(target.exists());
     }
 }
