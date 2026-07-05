@@ -8,6 +8,8 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
+pub mod checklist;
+
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
 
 /// Whether `badger clean` should show the interactive checklist rather than
