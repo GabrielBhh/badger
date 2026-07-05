@@ -45,7 +45,7 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
         }
         Command::Helper => {
-            bail!("`badger __helper` must be invoked by badger itself")
+            crate::privilege::helper_main(std::io::stdin().lock(), std::io::stdout().lock())
         }
         Command::Clean => {
             bail!("`badger clean` is not implemented yet — coming in a later phase")

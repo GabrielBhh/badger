@@ -63,12 +63,22 @@ pub struct Rule {
 
 /// Root-relative or `~`-relative path spec to a real path, given a `Ctx`.
 pub fn expand_path_spec(spec: &str, ctx: &Ctx) -> PathBuf {
+    expand_path_spec_parts(spec, &ctx.root, &ctx.home)
+}
+
+/// Same as `expand_path_spec`, but for callers (like the privileged helper)
+/// that have a root/home pair without a full `Ctx` to hand.
+pub fn expand_path_spec_parts(
+    spec: &str,
+    root: &std::path::Path,
+    home: &std::path::Path,
+) -> PathBuf {
     if let Some(rest) = spec.strip_prefix("~/") {
-        ctx.home.join(rest)
+        home.join(rest)
     } else if spec == "~" {
-        ctx.home.clone()
+        home.to_path_buf()
     } else if let Some(rest) = spec.strip_prefix('/') {
-        ctx.root.join(rest)
+        root.join(rest)
     } else {
         PathBuf::from(spec)
     }
