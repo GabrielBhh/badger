@@ -9,6 +9,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 pub mod checklist;
+pub mod confirm;
 
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
 
