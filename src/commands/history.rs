@@ -5,7 +5,10 @@ use crate::safety::journal::{Journal, Record};
 
 pub fn run(state_dir: &Path, run_filter: Option<&str>, mode: Mode) -> anyhow::Result<()> {
     let journal = Journal::new(state_dir);
-    let (records, _skipped) = journal.read_all()?;
+    let (records, skipped) = journal.read_all()?;
+    if let Some(warning) = warning_line(skipped) {
+        eprintln!("{warning}");
+    }
 
     match mode {
         Mode::Json => {
@@ -23,6 +26,16 @@ pub fn run(state_dir: &Path, run_filter: Option<&str>, mode: Mode) -> anyhow::Re
     Ok(())
 }
 
+fn warning_line(skipped: usize) -> Option<String> {
+    if skipped == 0 {
+        None
+    } else {
+        Some(format!(
+            "warning: {skipped} corrupt history line(s) skipped"
+        ))
+    }
+}
+
 fn render(records: &[Record], run_filter: Option<&str>) -> String {
     if records.is_empty() {
         return "No operations recorded yet.".to_string();
@@ -33,6 +46,12 @@ fn render(records: &[Record], run_filter: Option<&str>) -> String {
         if !run_order.contains(&record.run_id.as_str()) {
             run_order.push(&record.run_id);
         }
+    }
+
+    if let Some(filter) = run_filter
+        && !run_order.contains(&filter)
+    {
+        return format!("no run '{filter}' found");
     }
 
     let mut out = String::new();
@@ -129,5 +148,25 @@ mod tests {
         assert!(out.contains("run-1"));
         assert!(out.contains("badger clean"));
         assert!(out.contains("/home/user/.cache/foo"));
+    }
+
+    #[test]
+    fn test_run_filter_with_unknown_id_says_not_found() {
+        let records = vec![record("run-1", "clean", "paccache", 1024, false)];
+        let out = render(&records, Some("run-99"));
+        assert_eq!(out, "no run 'run-99' found");
+    }
+
+    #[test]
+    fn test_warning_line_none_for_zero_skipped() {
+        assert_eq!(warning_line(0), None);
+    }
+
+    #[test]
+    fn test_warning_line_some_for_nonzero_skipped() {
+        assert_eq!(
+            warning_line(3),
+            Some("warning: 3 corrupt history line(s) skipped".to_string())
+        );
     }
 }
