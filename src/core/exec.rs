@@ -136,7 +136,7 @@ impl Effector for RealEffector<'_> {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
 pub struct Summary {
     pub bytes_freed: u64,
     pub actions: usize,

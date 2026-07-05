@@ -3,6 +3,7 @@ use clap::CommandFactory;
 
 use crate::cli::{Cli, Command, WhitelistAction};
 
+pub mod clean;
 pub mod history;
 pub mod whitelist;
 
@@ -47,8 +48,15 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Helper => {
             crate::privilege::helper_main(std::io::stdin().lock(), std::io::stdout().lock())
         }
-        Command::Clean => {
-            bail!("`badger clean` is not implemented yet — coming in a later phase")
+        Command::Clean { yes } => {
+            let ctx = crate::ctx::Ctx::resolve(
+                cli.dry_run,
+                cli.debug,
+                crate::ctx::EnvOverrides::from_process(),
+            )?;
+            let mode = crate::output::current(cli.json);
+            println!("{}", clean::run(&ctx, yes, cli.dry_run, mode)?.rendered);
+            Ok(())
         }
         Command::Uninstall => {
             bail!("`badger uninstall` is not implemented yet — coming in a later phase")
