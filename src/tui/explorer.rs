@@ -421,13 +421,12 @@ impl SortMode {
     }
 }
 
-/// What one row in the main (directory-browsing) view represents. `Dir`
-/// carries the index of the child within the current directory's
-/// `children` — stable across re-sorts since sorting only reorders the
-/// display-facing `rows` vector, never `DirNode::children` itself.
+/// What one row in the main (directory-browsing) view represents. Dir rows
+/// are matched back to their `DirNode` by name (unique within a directory),
+/// so re-sorting only reorders the display-facing `rows` vector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowKind {
-    Dir(usize),
+    Dir,
     LooseFiles,
 }
 
@@ -483,9 +482,8 @@ fn build_rows(node: &DirNode, sort_mode: SortMode) -> Vec<Row> {
     let mut rows: Vec<Row> = node
         .children
         .iter()
-        .enumerate()
-        .map(|(i, child)| Row {
-            kind: RowKind::Dir(i),
+        .map(|child| Row {
+            kind: RowKind::Dir,
             name: child.name.clone(),
             bytes: child.bytes,
             mtime: child.mtime,
@@ -639,7 +637,7 @@ impl ExplorerState {
         }
         match self.rows.get(self.cursor) {
             Some(row) => match row.kind {
-                RowKind::Dir(_) => Selection::Dir {
+                RowKind::Dir => Selection::Dir {
                     path: self.current_path().join(&row.name),
                     bytes: row.bytes,
                 },
@@ -677,7 +675,7 @@ impl ExplorerState {
         let Some(row) = self.rows.get(self.cursor) else {
             return;
         };
-        if let RowKind::Dir(_) = row.kind {
+        if row.kind == RowKind::Dir {
             self.cursor_path.push(row.name.clone());
             self.cursor = 0;
             self.scroll = 0;
@@ -875,7 +873,7 @@ fn render_body(frame: &mut Frame, area: Rect, state: &ExplorerState) {
             };
             let marker = if i == state.cursor { ">" } else { " " };
             let age = format_age(row.mtime, state.now);
-            let would_trash = if matches!(row.kind, RowKind::Dir(_))
+            let would_trash = if row.kind == RowKind::Dir
                 && state.is_marked_would_trash(&current.join(&row.name))
             {
                 "  (would trash)"
