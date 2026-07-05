@@ -220,7 +220,7 @@ impl ExplorerSession {
                             humanize_bytes(freed)
                         ));
                     } else {
-                        state.remove_path(&path, bytes);
+                        state.remove_path(&path, freed);
                         state.set_status(format!(
                             "trashed {} ({}) — recoverable from the trash",
                             path.display(),
@@ -260,7 +260,7 @@ impl ExplorerSession {
     /// Enter on the permanent-delete prompt: only acts once the exact word
     /// "delete" has been typed.
     pub fn confirm_permanent(&mut self, effector: &mut dyn AnalyzeEffector) {
-        let Some(Prompt::Permanent { path, bytes, input }) = self.prompt.clone() else {
+        let Some(Prompt::Permanent { path, input, .. }) = self.prompt.clone() else {
             return;
         };
         if input != "delete" {
@@ -279,7 +279,7 @@ impl ExplorerSession {
                             humanize_bytes(freed)
                         ));
                     } else {
-                        state.remove_path(&path, bytes);
+                        state.remove_path(&path, freed);
                         state.set_status(format!(
                             "permanently deleted {} ({})",
                             path.display(),
@@ -739,6 +739,11 @@ impl ExplorerState {
     /// root itself is never removed. Deletes only ever target rows of the
     /// directory being browsed (or large-file entries), so the browsing
     /// position itself can't dangle.
+    /// `bytes` should be the effector's actual freed amount, not a
+    /// scan-time size — those can diverge (the tree changed underneath, or
+    /// only part of a delete succeeded). Note ancestor `files` counts are
+    /// not adjusted here (the effector doesn't report a file count), so
+    /// they go stale after a delete.
     pub fn remove_path(&mut self, path: &Path, bytes: u64) {
         fn walk(node: &mut DirNode, path: &Path, bytes: u64) {
             node.bytes = node.bytes.saturating_sub(bytes);
@@ -1636,9 +1641,29 @@ mod tests {
         assert_eq!(effector.trash_calls, vec![PathBuf::from("/scan/root/big")]);
         let explorer = session.explorer().unwrap();
         assert!(!explorer.rows.iter().any(|r| r.name == "big"));
-        assert_eq!(explorer.root.bytes, 4000);
+        // "big" was 8000 bytes when the prompt opened, but the effector
+        // reports 7900 actually freed — ancestors must shrink by the
+        // freed amount, not the stale scan-time size.
+        assert_eq!(explorer.root.bytes, 4100);
         assert!(explorer.status().unwrap().contains("trashed"));
         assert!(explorer.status().unwrap().contains("recoverable"));
+    }
+
+    #[test]
+    fn test_confirm_permanent_decrements_ancestors_by_freed_not_prompt_bytes() {
+        let mut session = browsing_session();
+        // Prompt bytes was 8000 (the scan-time size of "big"); the effector
+        // reports a different actual freed amount.
+        let mut effector = FakeEffector::permanent(Ok(7900));
+        session.request_delete();
+        session.confirm_trash(&mut effector); // cross-fs -> permanent prompt
+        for c in "delete".chars() {
+            session.prompt_input_push(c);
+        }
+        session.confirm_permanent(&mut effector);
+
+        let explorer = session.explorer().unwrap();
+        assert_eq!(explorer.root.bytes, 4100);
     }
 
     #[test]
