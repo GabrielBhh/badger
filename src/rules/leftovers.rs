@@ -193,10 +193,14 @@ fn is_old_enough(path: &Path, min_age_days: u32) -> bool {
 /// Real `/proc` scan for condition 5, always live (no sandboxing awareness)
 /// so it can be exercised directly against a spawned process — mirrors
 /// `rules::is_process_running`'s split between a live scan and a
-/// ctx-gated wrapper.
-fn is_process_using_path(dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return false;
+/// ctx-gated wrapper. `proc_dir` is parameterized (always `/proc` in
+/// production) so the read-error path can be exercised in a test. An
+/// unreadable `proc_dir` means process state is unknown, and unknown must
+/// fail closed toward "in use" (keep the directory) rather than toward
+/// deletion.
+fn is_process_using_path(dir: &Path, proc_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(proc_dir) else {
+        return true;
     };
     for entry in entries.flatten() {
         let pid = entry.file_name();
@@ -221,7 +225,7 @@ fn process_using_path(dir: &Path, ctx: &Ctx) -> bool {
     if ctx.sandboxed {
         return false;
     }
-    is_process_using_path(dir)
+    is_process_using_path(dir, Path::new("/proc"))
 }
 
 fn orphan_configs_detector(ctx: &Ctx, config: &Config) -> Vec<Candidate> {
@@ -585,11 +589,22 @@ mod tests {
             .spawn()
             .unwrap();
 
-        assert!(is_process_using_path(&used_dir));
-        assert!(!is_process_using_path(&unrelated_dir));
+        let proc_dir = Path::new("/proc");
+        assert!(is_process_using_path(&used_dir, proc_dir));
+        assert!(!is_process_using_path(&unrelated_dir, proc_dir));
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn test_is_process_using_path_read_dir_error_fails_closed_as_in_use() {
+        let f = fixture();
+        let dir = f.ctx.home.join("somedir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing_proc_dir = f.ctx.root.join("proc");
+
+        assert!(is_process_using_path(&dir, &missing_proc_dir));
     }
 
     // --- registry gating (see also rules::mod tests) ---
