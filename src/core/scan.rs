@@ -44,10 +44,18 @@ fn scan_rule(
     whitelist: &Whitelist,
     env: &SafetyEnv,
 ) -> Group {
-    let raw = raw_candidates(rule, ctx, config);
+    let (raw, detector_skipped) = raw_candidates(rule, ctx, config);
     let (candidates, skipped) = match rule.action {
-        Action::DeletePaths => finish_deletable_candidates(rule, raw, ctx, whitelist, env),
-        Action::Cmd(_) | Action::CmdSelected(_) => (size_only(raw), Vec::new()),
+        Action::DeletePaths => {
+            let (candidates, validation_skipped) =
+                finish_deletable_candidates(rule, raw, ctx, whitelist, env);
+            let mut skipped = detector_skipped;
+            skipped.extend(validation_skipped);
+            (candidates, skipped)
+        }
+        Action::Cmd(_) | Action::CmdSelected(_) | Action::CmdSelectedWithSkips(_) => {
+            (size_only(raw), detector_skipped)
+        }
     };
 
     Group {
@@ -60,17 +68,25 @@ fn scan_rule(
     }
 }
 
-fn raw_candidates(rule: &Rule, ctx: &Ctx, config: &Config) -> Vec<Candidate> {
+fn raw_candidates(
+    rule: &Rule,
+    ctx: &Ctx,
+    config: &Config,
+) -> (Vec<Candidate>, Vec<(String, String)>) {
     match &rule.detector {
-        Detector::Globs(patterns) => patterns
-            .iter()
-            .flat_map(|pattern| expand_glob_spec(pattern, ctx))
-            .map(|path| {
-                let label = display_label(&path, ctx);
-                Candidate::new(Some(path), label, 0, rule.risk)
-            })
-            .collect(),
-        Detector::Fn(f) => f(ctx, config),
+        Detector::Globs(patterns) => (
+            patterns
+                .iter()
+                .flat_map(|pattern| expand_glob_spec(pattern, ctx))
+                .map(|path| {
+                    let label = display_label(&path, ctx);
+                    Candidate::new(Some(path), label, 0, rule.risk)
+                })
+                .collect(),
+            Vec::new(),
+        ),
+        Detector::Fn(f) => (f(ctx, config), Vec::new()),
+        Detector::FnWithSkips(f) => f(ctx, config),
     }
 }
 
@@ -412,6 +428,98 @@ mod tests {
         };
         let groups = scan(&[rule], &f.ctx, &f.ctx.config.clone(), &empty_whitelist()).unwrap();
         assert!(groups.is_empty());
+    }
+
+    // --- Detector::FnWithSkips ---
+
+    fn fn_with_skips_detector(
+        _ctx: &Ctx,
+        _config: &Config,
+    ) -> (Vec<Candidate>, Vec<(String, String)>) {
+        (
+            vec![Candidate::new(None, "kept".to_string(), 0, Risk::Safe)],
+            vec![(
+                "excluded thing".to_string(),
+                "reason it was excluded".to_string(),
+            )],
+        )
+    }
+
+    fn cmd_action_noop(_ctx: &Ctx, _config: &Config) -> Vec<CmdSpec> {
+        Vec::new()
+    }
+
+    #[test]
+    fn test_fn_with_skips_detector_under_cmd_action_surfaces_detector_skips_in_group() {
+        let f = fixture();
+        let rule = Rule {
+            id: "test.fn_with_skips_cmd",
+            title: "Fn with skips (cmd action)",
+            risk: Risk::Safe,
+            requires_sudo: false,
+            applicable: Applicability::Always,
+            allowed_prefixes: &[],
+            detector: Detector::FnWithSkips(fn_with_skips_detector),
+            action: Action::Cmd(cmd_action_noop),
+            notes: "",
+        };
+
+        let groups = scan(&[rule], &f.ctx, &f.ctx.config.clone(), &empty_whitelist()).unwrap();
+        assert_eq!(groups[0].candidates.len(), 1);
+        assert_eq!(groups[0].candidates[0].label, "kept");
+        assert_eq!(
+            groups[0].skipped,
+            vec![(
+                "excluded thing".to_string(),
+                "reason it was excluded".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_fn_with_skips_detector_under_delete_paths_prepends_detector_skips_to_validation_skips()
+    {
+        let f = fixture();
+        std::fs::create_dir_all(f.ctx.home.join(".ssh")).unwrap();
+        std::fs::write(f.ctx.home.join(".ssh/id_rsa"), b"secret").unwrap();
+
+        fn detector_with_denylisted_candidate(
+            ctx: &Ctx,
+            _config: &Config,
+        ) -> (Vec<Candidate>, Vec<(String, String)>) {
+            let path = ctx.home.join(".ssh");
+            (
+                vec![Candidate::new(
+                    Some(path),
+                    "~/.ssh".to_string(),
+                    0,
+                    Risk::Safe,
+                )],
+                vec![(
+                    "excluded thing".to_string(),
+                    "reason it was excluded".to_string(),
+                )],
+            )
+        }
+
+        let rule = Rule {
+            id: "test.fn_with_skips_delete",
+            title: "Fn with skips (delete action)",
+            risk: Risk::Safe,
+            requires_sudo: false,
+            applicable: Applicability::Always,
+            allowed_prefixes: &["~"],
+            detector: Detector::FnWithSkips(detector_with_denylisted_candidate),
+            action: Action::DeletePaths,
+            notes: "",
+        };
+
+        let groups = scan(&[rule], &f.ctx, &f.ctx.config.clone(), &empty_whitelist()).unwrap();
+        assert!(groups[0].candidates.is_empty());
+        assert_eq!(groups[0].skipped.len(), 2);
+        assert_eq!(groups[0].skipped[0].0, "excluded thing");
+        assert_eq!(groups[0].skipped[1].0, "~/.ssh");
+        assert_eq!(groups[0].skipped[1].1, Refusal::DenyListed.to_string());
     }
 
     #[test]

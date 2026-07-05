@@ -45,6 +45,13 @@ pub fn command_exists(name: &str, ctx: &Ctx) -> bool {
         .unwrap_or(false)
 }
 
+/// A `(label, reason)` skip note, same shape as `Group.skipped`.
+pub type Skip = (String, String);
+
+/// A detector function's return value: the candidates found, plus any skip
+/// notes for candidates it refused to offer.
+pub type DetectorResult = (Vec<Candidate>, Vec<Skip>);
+
 /// How a rule finds its candidates.
 pub enum Detector {
     /// `~`-prefixed (ctx home) or root-relative (ctx root) path specs. A
@@ -54,6 +61,11 @@ pub enum Detector {
     /// Escape hatch for rules whose candidate set needs custom logic (age
     /// filtering, exclusion lists, process checks, ...).
     Fn(fn(&Ctx, &Config) -> Vec<Candidate>),
+    /// Like `Fn`, but the detector can also report visible skip notes
+    /// (`(label, reason)` pairs, same shape as `Group.skipped`) explaining
+    /// candidates it refused to offer — needed by rules whose exclusions
+    /// happen inside the detector rather than in `validate_deletable`.
+    FnWithSkips(fn(&Ctx, &Config) -> DetectorResult),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -62,6 +74,10 @@ pub struct CmdSpec {
     pub sudo: bool,
     pub label: String,
 }
+
+/// A `CmdSelectedWithSkips` builder's return value: the commands to run,
+/// plus any skip notes for selected candidates it refused to act on.
+pub type CmdSelectedWithSkipsResult = (Vec<CmdSpec>, Vec<Skip>);
 
 /// What happens when a rule's selected candidates are executed.
 pub enum Action {
@@ -75,6 +91,11 @@ pub enum Action {
     /// Never invoked with an empty selection — nothing selected means no
     /// command runs at all.
     CmdSelected(fn(&Ctx, &Config, &[Candidate]) -> Vec<CmdSpec>),
+    /// Like `CmdSelected`, but the builder may also refuse part of the
+    /// selection: each returned `(label, reason)` skip is journaled as a
+    /// `skipped: <label> — <reason>` outcome (surfacing in the run's notes
+    /// via `execution_notes`) instead of running anything for it.
+    CmdSelectedWithSkips(fn(&Ctx, &Config, &[Candidate]) -> CmdSelectedWithSkipsResult),
 }
 
 pub struct Rule {

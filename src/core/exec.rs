@@ -285,6 +285,38 @@ fn run_specs(
     }
 }
 
+/// Journals one `skipped: <label> — <reason>` record per `(label, reason)`
+/// skip returned by an `Action::CmdSelectedWithSkips` builder — the part of
+/// the selection it refused to run anything for.
+fn journal_skips(
+    skips: Vec<(String, String)>,
+    rule: &Rule,
+    journal: &Journal,
+    run_id: &str,
+    dry_run: bool,
+    summary: &mut Summary,
+) {
+    for (label, reason) in skips {
+        summary.actions += 1;
+        append_or_warn(
+            journal,
+            &Record::now(
+                run_id.to_string(),
+                "clean".to_string(),
+                rule.id.to_string(),
+                "cmd".to_string(),
+                None,
+                None,
+                rule.requires_sudo,
+                dry_run,
+                0,
+                format!("skipped: {label} — {reason}"),
+            ),
+            summary,
+        );
+    }
+}
+
 /// Executes every Safe-tier group's selected candidates (or, for
 /// `Action::Cmd` rules, its commands). Moderate/Risky groups are never
 /// auto-executed here — that's what `--yes` acts on non-interactively, and
@@ -382,6 +414,28 @@ pub fn execute(
                     dry_run,
                     &mut summary,
                 );
+            }
+            Action::CmdSelectedWithSkips(build_specs) => {
+                let selected: Vec<Candidate> = group
+                    .candidates
+                    .iter()
+                    .filter(|c| c.selectable)
+                    .cloned()
+                    .collect();
+                if selected.is_empty() {
+                    continue;
+                }
+                let (specs, skips) = build_specs(ctx, config, &selected);
+                run_specs(
+                    specs,
+                    rule.id,
+                    effector,
+                    journal,
+                    run_id,
+                    dry_run,
+                    &mut summary,
+                );
+                journal_skips(skips, rule, journal, run_id, dry_run, &mut summary);
             }
         }
     }
@@ -526,6 +580,29 @@ pub fn execute_selected(
                     dry_run,
                     &mut summary,
                 );
+            }
+            Action::CmdSelectedWithSkips(build_specs) => {
+                let selected: Vec<Candidate> = group
+                    .candidates
+                    .iter()
+                    .enumerate()
+                    .filter(|(ci, _)| selection.contains(&(gi, *ci)))
+                    .map(|(_, c)| c.clone())
+                    .collect();
+                if selected.is_empty() {
+                    continue;
+                }
+                let (specs, skips) = build_specs(ctx, config, &selected);
+                run_specs(
+                    specs,
+                    rule.id,
+                    effector,
+                    journal,
+                    run_id,
+                    dry_run,
+                    &mut summary,
+                );
+                journal_skips(skips, rule, journal, run_id, dry_run, &mut summary);
             }
         }
     }
@@ -1274,6 +1351,139 @@ mod tests {
             "would run: pacman -Rns --noconfirm pkg-b"
         );
         assert!(records[0].dry_run);
+    }
+
+    // --- Action::CmdSelectedWithSkips ---
+
+    fn cmd_selected_with_skips_rule_and_group(id: &'static str) -> (Rule, Group) {
+        fn build_specs(
+            _ctx: &Ctx,
+            _config: &Config,
+            selected: &[Candidate],
+        ) -> (Vec<CmdSpec>, Vec<(String, String)>) {
+            let mut specs = Vec::new();
+            let mut skips = Vec::new();
+            for c in selected {
+                if c.label == "good" {
+                    specs.push(CmdSpec {
+                        argv: vec!["snapper".to_string(), "cleanup".to_string()],
+                        sudo: true,
+                        label: "test spec".to_string(),
+                    });
+                } else {
+                    skips.push((
+                        c.label.clone(),
+                        "could not be safely interpreted".to_string(),
+                    ));
+                }
+            }
+            (specs, skips)
+        }
+        let rule = Rule {
+            id,
+            title: "test cmd_selected_with_skips rule",
+            risk: Risk::Risky,
+            requires_sudo: true,
+            applicable: Applicability::Always,
+            allowed_prefixes: &[],
+            detector: Detector::Globs(&[]),
+            action: Action::CmdSelectedWithSkips(build_specs),
+            notes: "",
+        };
+        let group = Group {
+            rule_id: id.to_string(),
+            title: "test cmd_selected_with_skips rule".to_string(),
+            risk: Risk::Risky,
+            requires_sudo: true,
+            candidates: vec![
+                Candidate::new(None, "good".to_string(), 0, Risk::Risky),
+                Candidate::new(None, "bad".to_string(), 0, Risk::Risky),
+            ],
+            skipped: Vec::new(),
+        };
+        (rule, group)
+    }
+
+    #[test]
+    fn test_execute_selected_cmd_selected_with_skips_journals_spec_and_skip() {
+        let f = fixture();
+        let (rule, group) = cmd_selected_with_skips_rule_and_group("test.cmd_selected_with_skips");
+        let journal = Journal::new(&f.ctx.state_dir);
+        let mut effector = DryRunEffector;
+
+        let summary = execute_selected(
+            &[group],
+            &HashSet::from([(0usize, 0usize), (0usize, 1usize)]),
+            &[rule],
+            &f.ctx,
+            &f.ctx.config.clone(),
+            &mut effector,
+            &journal,
+            "run-1",
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(summary.actions, 2);
+        let (records, _) = journal.read_all().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].outcome, "would run: snapper cleanup");
+        assert!(records[1].outcome.starts_with("skipped:"));
+        assert!(records[1].outcome.contains("bad"));
+        assert!(records[1].sudo);
+
+        let notes = crate::commands::shared::execution_notes(&journal, "run-1").unwrap();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("skipped:"));
+    }
+
+    #[test]
+    fn test_execute_selected_cmd_selected_with_skips_builder_only_invoked_when_selection_nonempty()
+    {
+        let f = fixture();
+        fn build_specs_should_not_run(
+            _ctx: &Ctx,
+            _config: &Config,
+            _selected: &[Candidate],
+        ) -> (Vec<CmdSpec>, Vec<(String, String)>) {
+            panic!("builder must not be invoked with an empty selection");
+        }
+        let rule = Rule {
+            id: "test.cmd_selected_with_skips_empty",
+            title: "test rule",
+            risk: Risk::Risky,
+            requires_sudo: true,
+            applicable: Applicability::Always,
+            allowed_prefixes: &[],
+            detector: Detector::Globs(&[]),
+            action: Action::CmdSelectedWithSkips(build_specs_should_not_run),
+            notes: "",
+        };
+        let group = Group {
+            rule_id: "test.cmd_selected_with_skips_empty".to_string(),
+            title: "test rule".to_string(),
+            risk: Risk::Risky,
+            requires_sudo: true,
+            candidates: vec![Candidate::new(None, "x".to_string(), 0, Risk::Risky)],
+            skipped: Vec::new(),
+        };
+        let journal = Journal::new(&f.ctx.state_dir);
+        let mut effector = RealEffector::new(&f.ctx, Box::new(FakeRunner::new()));
+
+        let summary = execute_selected(
+            &[group],
+            &HashSet::new(),
+            &[rule],
+            &f.ctx,
+            &f.ctx.config.clone(),
+            &mut effector,
+            &journal,
+            "run-1",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(summary.actions, 0);
     }
 
     #[test]
