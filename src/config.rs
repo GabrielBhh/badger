@@ -19,6 +19,10 @@ pub struct Clean {
     pub paccache_keep: u32,
     pub journal_max_size: String,
     pub trash_older_than_days: u32,
+    /// How old (by mtime) an unmatched `~/.config`/`~/.local/share`/`~/.cache`
+    /// directory must be before `leftovers.orphan_configs` (experimental)
+    /// will consider it a candidate.
+    pub orphan_min_age_days: u32,
 }
 
 impl Default for Clean {
@@ -27,6 +31,7 @@ impl Default for Clean {
             paccache_keep: 2,
             journal_max_size: "300M".to_string(),
             trash_older_than_days: 30,
+            orphan_min_age_days: 180,
         }
     }
 }
@@ -119,7 +124,15 @@ mod tests {
         let cfg = load_from_str("[clean]\npaccache_keep = 5\n").unwrap();
         assert_eq!(cfg.clean.paccache_keep, 5);
         assert_eq!(cfg.clean.journal_max_size, "300M");
+        assert_eq!(cfg.clean.orphan_min_age_days, 180);
         assert_eq!(cfg.purge, Purge::default());
+    }
+
+    #[test]
+    fn test_orphan_min_age_days_defaults_and_can_be_overridden() {
+        assert_eq!(Clean::default().orphan_min_age_days, 180);
+        let cfg = load_from_str("[clean]\norphan_min_age_days = 10\n").unwrap();
+        assert_eq!(cfg.clean.orphan_min_age_days, 10);
     }
 
     #[test]

@@ -7,10 +7,22 @@
 use std::collections::HashSet;
 
 use crossterm::event::{Event, KeyEventKind};
+use serde::Serialize;
 
+use crate::core::exec::Summary;
 use crate::core::item::Group;
 use crate::safety::journal::Journal;
 use crate::tui::{self, checklist, confirm};
+
+/// The `--json` payload every scan-and-execute command (`clean`, `purge`,
+/// `optimize`) emits: the scanned groups, the execution summary (absent for
+/// a plain plan), and whether this was a dry run.
+#[derive(Serialize)]
+pub(crate) struct JsonOutput<'a> {
+    pub(crate) groups: &'a [Group],
+    pub(crate) summary: Option<&'a Summary>,
+    pub(crate) dry_run: bool,
+}
 
 /// Drives the checklist -> confirm key-handling loop against a real
 /// terminal. Returns the confirmed selection, or `None` if the person

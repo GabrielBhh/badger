@@ -5,7 +5,8 @@ fn main() {
     let cli = badger::cli::Cli::parse();
 
     let yes = match &cli.command {
-        Command::Clean { yes } | Command::Purge { yes } => Some(*yes),
+        Command::Clean { yes, .. } => Some(*yes),
+        Command::Purge { yes } | Command::Optimize { yes } => Some(*yes),
         // `uninstall`, `analyze`, and `status` have no `--yes` shortcut —
         // they're always attempting the interactive path unless mode/tty
         // checks inside them say otherwise.

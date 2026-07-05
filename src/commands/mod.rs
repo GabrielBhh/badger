@@ -1,6 +1,5 @@
 use std::io::IsTerminal;
 
-use anyhow::bail;
 use clap::CommandFactory;
 
 use crate::cli::{Cli, Command, WhitelistAction};
@@ -8,6 +7,7 @@ use crate::cli::{Cli, Command, WhitelistAction};
 pub mod analyze;
 pub mod clean;
 pub mod history;
+pub mod optimize;
 pub mod purge;
 pub(crate) mod shared;
 pub mod status;
@@ -55,14 +55,14 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Helper => {
             crate::privilege::helper_main(std::io::stdin().lock(), std::io::stdout().lock())
         }
-        Command::Clean { yes } => {
+        Command::Clean { yes, experimental } => {
             let ctx = crate::ctx::Ctx::resolve(
                 cli.dry_run,
                 cli.debug,
                 crate::ctx::EnvOverrides::from_process(),
             )?;
             let mode = crate::output::current(cli.json);
-            let output = clean::run(&ctx, yes, cli.dry_run, mode)?;
+            let output = clean::run(&ctx, yes, cli.dry_run, mode, experimental)?;
             // Interactive cancel prints its own "nothing cleaned" note to
             // stderr and returns nothing to render — don't add a blank
             // stdout line on top of it.
@@ -87,8 +87,21 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Optimize => {
-            bail!("`badger optimize` is not implemented yet — coming in a later phase")
+        Command::Optimize { yes } => {
+            let ctx = crate::ctx::Ctx::resolve(
+                cli.dry_run,
+                cli.debug,
+                crate::ctx::EnvOverrides::from_process(),
+            )?;
+            let mode = crate::output::current(cli.json);
+            let output = optimize::run(&ctx, yes, cli.dry_run, mode)?;
+            // Interactive cancel prints its own "nothing run" note to
+            // stderr and returns nothing to render — don't add a blank
+            // stdout line on top of it.
+            if !output.rendered.is_empty() {
+                println!("{}", output.rendered);
+            }
+            Ok(())
         }
         Command::Status {
             proc_cpu_threshold,
