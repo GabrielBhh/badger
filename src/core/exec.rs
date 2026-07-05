@@ -87,6 +87,9 @@ impl<'a> RealEffector<'a> {
 
 impl Effector for RealEffector<'_> {
     fn delete(&mut self, rule: &Rule, path: &Path, _estimated_bytes: u64) -> DeleteOutcome {
+        // Re-read /proc/self/mountinfo per candidate rather than caching it
+        // once for the batch: mounts can change mid-run, and this is the
+        // freshest possible TOCTOU state right before the delete.
         let env = match SafetyEnv::from_system(self.ctx) {
             Ok(env) => env,
             Err(e) => {
@@ -214,6 +217,22 @@ impl Effector for RealEffector<'_> {
 pub struct Summary {
     pub bytes_freed: u64,
     pub actions: usize,
+    /// Journal-append failures encountered mid-batch. A failed audit-trail
+    /// write must not abort execution (the delete/run already happened), so
+    /// these are collected here instead of propagated via `?`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub journal_warnings: Vec<String>,
+}
+
+/// Appends `record` to `journal`; a failed audit-trail write must not abort
+/// the batch (the delete/run it describes already happened), so it's
+/// collected as a warning on `summary` instead of propagated with `?`.
+fn append_or_warn(journal: &Journal, record: &Record, summary: &mut Summary) {
+    if let Err(e) = journal.append(record) {
+        summary
+            .journal_warnings
+            .push(format!("failed to record audit trail: {e:#}"));
+    }
 }
 
 /// Executes every Safe-tier group's selected candidates (or, for
@@ -259,36 +278,44 @@ pub fn execute(
                     let outcome = effector.delete(rule, path, candidate.bytes);
                     summary.bytes_freed += outcome.bytes_freed;
                     summary.actions += 1;
-                    journal.append(&Record::now(
-                        run_id.to_string(),
-                        "clean".to_string(),
-                        rule.id.to_string(),
-                        "delete".to_string(),
-                        None,
-                        Some(vec![path.display().to_string()]),
-                        false,
-                        dry_run,
-                        outcome.bytes_freed,
-                        outcome.outcome,
-                    ))?;
+                    append_or_warn(
+                        journal,
+                        &Record::now(
+                            run_id.to_string(),
+                            "clean".to_string(),
+                            rule.id.to_string(),
+                            "delete".to_string(),
+                            None,
+                            Some(vec![path.display().to_string()]),
+                            false,
+                            dry_run,
+                            outcome.bytes_freed,
+                            outcome.outcome,
+                        ),
+                        &mut summary,
+                    );
                 }
             }
             Action::Cmd(build_specs) => {
                 for spec in build_specs(ctx, config) {
                     let outcome = effector.run(&spec);
                     summary.actions += 1;
-                    journal.append(&Record::now(
-                        run_id.to_string(),
-                        "clean".to_string(),
-                        rule.id.to_string(),
-                        "cmd".to_string(),
-                        Some(spec.argv.clone()),
-                        None,
-                        spec.sudo,
-                        dry_run,
-                        0,
-                        outcome.outcome,
-                    ))?;
+                    append_or_warn(
+                        journal,
+                        &Record::now(
+                            run_id.to_string(),
+                            "clean".to_string(),
+                            rule.id.to_string(),
+                            "cmd".to_string(),
+                            Some(spec.argv.clone()),
+                            None,
+                            spec.sudo,
+                            dry_run,
+                            0,
+                            outcome.outcome,
+                        ),
+                        &mut summary,
+                    );
                 }
             }
         }
@@ -340,18 +367,22 @@ pub fn execute_selected(
                         let outcome = effector.delete(rule, path, candidate.bytes);
                         summary.bytes_freed += outcome.bytes_freed;
                         summary.actions += 1;
-                        journal.append(&Record::now(
-                            run_id.to_string(),
-                            "clean".to_string(),
-                            rule.id.to_string(),
-                            "delete".to_string(),
-                            None,
-                            Some(vec![path.display().to_string()]),
-                            false,
-                            dry_run,
-                            outcome.bytes_freed,
-                            outcome.outcome,
-                        ))?;
+                        append_or_warn(
+                            journal,
+                            &Record::now(
+                                run_id.to_string(),
+                                "clean".to_string(),
+                                rule.id.to_string(),
+                                "delete".to_string(),
+                                None,
+                                Some(vec![path.display().to_string()]),
+                                false,
+                                dry_run,
+                                outcome.bytes_freed,
+                                outcome.outcome,
+                            ),
+                            &mut summary,
+                        );
                         continue;
                     }
 
@@ -365,18 +396,22 @@ pub fn execute_selected(
                         }),
                         Err(e) => {
                             summary.actions += 1;
-                            journal.append(&Record::now(
-                                run_id.to_string(),
-                                "clean".to_string(),
-                                rule.id.to_string(),
-                                "delete".to_string(),
-                                None,
-                                Some(vec![path.display().to_string()]),
-                                true,
-                                dry_run,
-                                0,
-                                format!("error: cannot stat {}: {e}", path.display()),
-                            ))?;
+                            append_or_warn(
+                                journal,
+                                &Record::now(
+                                    run_id.to_string(),
+                                    "clean".to_string(),
+                                    rule.id.to_string(),
+                                    "delete".to_string(),
+                                    None,
+                                    Some(vec![path.display().to_string()]),
+                                    true,
+                                    dry_run,
+                                    0,
+                                    format!("error: cannot stat {}: {e}", path.display()),
+                                ),
+                                &mut summary,
+                            );
                         }
                     }
                 }
@@ -393,18 +428,22 @@ pub fn execute_selected(
                 for spec in build_specs(ctx, config) {
                     let outcome = effector.run(&spec);
                     summary.actions += 1;
-                    journal.append(&Record::now(
-                        run_id.to_string(),
-                        "clean".to_string(),
-                        rule.id.to_string(),
-                        "cmd".to_string(),
-                        Some(spec.argv.clone()),
-                        None,
-                        spec.sudo,
-                        dry_run,
-                        0,
-                        outcome.outcome,
-                    ))?;
+                    append_or_warn(
+                        journal,
+                        &Record::now(
+                            run_id.to_string(),
+                            "clean".to_string(),
+                            rule.id.to_string(),
+                            "cmd".to_string(),
+                            Some(spec.argv.clone()),
+                            None,
+                            spec.sudo,
+                            dry_run,
+                            0,
+                            outcome.outcome,
+                        ),
+                        &mut summary,
+                    );
                 }
             }
         }
@@ -415,18 +454,22 @@ pub fn execute_selected(
         for (op, outcome) in privileged_ops.iter().zip(outcomes) {
             summary.bytes_freed += outcome.bytes_freed;
             summary.actions += 1;
-            journal.append(&Record::now(
-                run_id.to_string(),
-                "clean".to_string(),
-                op.rule_id.clone(),
-                "delete".to_string(),
-                None,
-                Some(vec![op.path.display().to_string()]),
-                true,
-                dry_run,
-                outcome.bytes_freed,
-                outcome.outcome,
-            ))?;
+            append_or_warn(
+                journal,
+                &Record::now(
+                    run_id.to_string(),
+                    "clean".to_string(),
+                    op.rule_id.clone(),
+                    "delete".to_string(),
+                    None,
+                    Some(vec![op.path.display().to_string()]),
+                    true,
+                    dry_run,
+                    outcome.bytes_freed,
+                    outcome.outcome,
+                ),
+                &mut summary,
+            );
         }
     }
 
@@ -558,6 +601,52 @@ mod tests {
         let (records, _) = journal.read_all().unwrap();
         assert_eq!(records[0].outcome, "ok");
         assert!(!records[0].dry_run);
+    }
+
+    // Regression: a failing journal.append() used to abort execute() via `?`,
+    // so a delete that had already happened went unjournaled and the caller
+    // never got the freed-bytes summary. It must now continue and surface the
+    // failure as a warning instead.
+    #[test]
+    fn test_execute_continues_and_warns_when_journal_append_fails() {
+        let f = fixture();
+        let target = f.ctx.home.join(".cache/target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("f.txt"), vec![0u8; 4096]).unwrap();
+
+        let rule = delete_rule("test.rule", false);
+        let group = group_with_one_candidate("test.rule", target.clone(), 4096);
+
+        // Make the journal's state dir itself a regular file, so `append`'s
+        // `create_dir_all(parent)` fails deterministically (ENOTDIR),
+        // regardless of user privileges.
+        std::fs::write(&f.ctx.state_dir, b"not a directory").unwrap();
+        let journal = Journal::new(&f.ctx.state_dir);
+        let mut effector = RealEffector::new(&f.ctx, Box::new(FakeRunner::new()));
+
+        let summary = execute(
+            &[group],
+            &[rule],
+            &f.ctx,
+            &f.ctx.config.clone(),
+            &mut effector,
+            &journal,
+            "run-1",
+            false,
+        )
+        .unwrap();
+
+        assert!(!target.exists(), "the delete must still happen");
+        assert_eq!(summary.actions, 1);
+        assert!(
+            summary.bytes_freed > 0,
+            "the freed-bytes summary must still be reported"
+        );
+        assert_eq!(
+            summary.journal_warnings.len(),
+            1,
+            "the failed audit-trail write must be surfaced as a warning"
+        );
     }
 
     #[test]

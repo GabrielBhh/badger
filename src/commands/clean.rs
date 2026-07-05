@@ -41,9 +41,10 @@ pub fn run(ctx: &Ctx, yes: bool, dry_run_flag: bool, mode: Mode) -> anyhow::Resu
     let will_execute = yes || dry_run_flag;
     let is_dry_run = dry_run_flag || !yes;
 
+    let journal = Journal::new(&ctx.state_dir);
+    let run_id = jiff::Timestamp::now().to_string();
+
     let summary = if will_execute {
-        let journal = Journal::new(&ctx.state_dir);
-        let run_id = jiff::Timestamp::now().to_string();
         Some(if is_dry_run {
             let mut effector = DryRunEffector;
             execute(
@@ -73,7 +74,11 @@ pub fn run(ctx: &Ctx, yes: bool, dry_run_flag: bool, mode: Mode) -> anyhow::Resu
         None
     };
 
-    let rendered = match mode {
+    for warning in summary.iter().flat_map(|s| &s.journal_warnings) {
+        eprintln!("warning: {warning}");
+    }
+
+    let mut rendered = match mode {
         Mode::Json => serde_json::to_string(&JsonOutput {
             groups: &groups,
             summary: summary.as_ref(),
@@ -81,7 +86,34 @@ pub fn run(ctx: &Ctx, yes: bool, dry_run_flag: bool, mode: Mode) -> anyhow::Resu
         })?,
         Mode::Human => render_human(&groups, &rules, summary.as_ref(), will_execute, is_dry_run),
     };
+    // Non-interactive `--yes` never re-reads the journal for execution-time
+    // outcomes: a TOCTOU refusal or delete error just silently shrank the
+    // "Freed" total. Surface them the same way the interactive path does.
+    if will_execute && mode == Mode::Human {
+        for note in execution_notes(&journal, &run_id)? {
+            rendered.push_str(&format!("\n  {note}"));
+        }
+    }
     Ok(CleanOutput { rendered })
+}
+
+/// Reads back the journal for `run_id` and formats "note: <rule> —
+/// <outcome>" lines for skipped/error/refused outcomes recorded during
+/// execution. Shared by the `--yes` non-interactive path and the interactive
+/// TUI path (`render_after_selection`) so execution-time refusals (TOCTOU,
+/// privileged-helper errors, ...) are never silently invisible.
+fn execution_notes(journal: &Journal, run_id: &str) -> anyhow::Result<Vec<String>> {
+    let (records, _) = journal.read_all()?;
+    Ok(records
+        .iter()
+        .filter(|r| r.run_id == run_id)
+        .filter(|r| {
+            r.outcome.starts_with("skipped")
+                || r.outcome.starts_with("error")
+                || r.outcome.starts_with("refused")
+        })
+        .map(|r| format!("note: {} — {}", r.rule, r.outcome))
+        .collect())
 }
 
 /// Interactive `badger clean`: scan, show the checklist and risk-scaled
@@ -211,6 +243,10 @@ fn render_after_selection(
         )?
     };
 
+    for warning in &summary.journal_warnings {
+        eprintln!("warning: {warning}");
+    }
+
     let mut out = if dry_run {
         format!(
             "Would free {} — dry run — nothing deleted (recorded in history).",
@@ -220,14 +256,8 @@ fn render_after_selection(
         format!("Freed {}.", humanize_bytes(summary.bytes_freed))
     };
 
-    let (records, _) = journal.read_all()?;
-    for record in records.iter().filter(|r| r.run_id == run_id) {
-        if record.outcome.starts_with("skipped")
-            || record.outcome.starts_with("error")
-            || record.outcome.starts_with("refused")
-        {
-            out.push_str(&format!("\n  note: {} — {}", record.rule, record.outcome));
-        }
+    for note in execution_notes(journal, &run_id)? {
+        out.push_str(&format!("\n  {note}"));
     }
 
     Ok(CleanOutput { rendered: out })
@@ -612,5 +642,29 @@ mod tests {
         assert!(output.rendered.contains("note:"));
         assert!(output.rendered.contains("skipped"));
         assert!(target.exists());
+    }
+
+    // Regression: the non-interactive `--yes` human path never re-read the
+    // journal for execution-time outcomes (only the interactive TUI path
+    // did via render_after_selection), so an execution-time refusal/skip just
+    // silently shrank the "Freed" total instead of being surfaced as a note.
+    #[test]
+    fn test_run_yes_human_surfaces_an_execution_time_sudo_skip_as_a_note() {
+        let f = exec_fixture();
+        let mut ctx = f.ctx.clone();
+        // `pacman.cache` only shows up once its command is "available"; its
+        // Cmd action is sudo, and RealEffector::run() refuses to run sudo in
+        // a sandbox — that refusal only happens at execution time, never at
+        // scan time, so it's exactly the kind of note this fix must surface.
+        ctx.available_commands = Some(vec!["paccache".to_string()]);
+
+        let output = run(&ctx, true, false, Mode::Human).unwrap();
+
+        assert!(
+            output.rendered.contains("note:"),
+            "execution-time sudo skip must be surfaced, got: {}",
+            output.rendered
+        );
+        assert!(output.rendered.contains("skipped"));
     }
 }
