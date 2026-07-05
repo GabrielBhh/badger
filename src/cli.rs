@@ -27,7 +27,11 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Clean caches, logs, and other reclaimable space
-    Clean,
+    Clean {
+        /// Actually delete Safe-tier selections (default just plans)
+        #[arg(long)]
+        yes: bool,
+    },
     /// Uninstall unused packages
     Uninstall,
     /// Optimize mirrors and system settings
