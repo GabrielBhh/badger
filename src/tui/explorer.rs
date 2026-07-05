@@ -101,6 +101,10 @@ pub struct ExplorerSession {
     totals: DiskTotals,
     now: i64,
     prompt: Option<Prompt>,
+    /// In a dry run, confirmed deletes only mark rows "(would trash)" —
+    /// the injected effector journals but nothing moves, so the tree's
+    /// numbers must not change either.
+    dry_run: bool,
 }
 
 impl ExplorerSession {
@@ -111,7 +115,12 @@ impl ExplorerSession {
             totals,
             now,
             prompt: None,
+            dry_run: false,
         }
+    }
+
+    pub fn set_dry_run(&mut self, dry_run: bool) {
+        self.dry_run = dry_run;
     }
 
     pub fn is_scanning(&self) -> bool {
@@ -201,13 +210,23 @@ impl ExplorerSession {
         match effector.trash(&path) {
             Ok(freed) => {
                 self.prompt = None;
+                let dry_run = self.dry_run;
                 if let Some(state) = self.explorer.as_mut() {
-                    state.remove_path(&path, bytes);
-                    state.set_status(format!(
-                        "trashed {} ({}) — recoverable from the trash",
-                        path.display(),
-                        humanize_bytes(freed)
-                    ));
+                    if dry_run {
+                        state.mark_would_trash(path.clone());
+                        state.set_status(format!(
+                            "would trash {} ({}) — dry run, nothing moved",
+                            path.display(),
+                            humanize_bytes(freed)
+                        ));
+                    } else {
+                        state.remove_path(&path, bytes);
+                        state.set_status(format!(
+                            "trashed {} ({}) — recoverable from the trash",
+                            path.display(),
+                            humanize_bytes(freed)
+                        ));
+                    }
                 }
             }
             Err(TrashError::CrossFilesystem) => {
@@ -248,15 +267,25 @@ impl ExplorerSession {
             return;
         }
         self.prompt = None;
+        let dry_run = self.dry_run;
         match effector.delete_permanent(&path) {
             Ok(freed) => {
                 if let Some(state) = self.explorer.as_mut() {
-                    state.remove_path(&path, bytes);
-                    state.set_status(format!(
-                        "permanently deleted {} ({})",
-                        path.display(),
-                        humanize_bytes(freed)
-                    ));
+                    if dry_run {
+                        state.mark_would_trash(path.clone());
+                        state.set_status(format!(
+                            "would permanently delete {} ({}) — dry run, nothing moved",
+                            path.display(),
+                            humanize_bytes(freed)
+                        ));
+                    } else {
+                        state.remove_path(&path, bytes);
+                        state.set_status(format!(
+                            "permanently deleted {} ({})",
+                            path.display(),
+                            humanize_bytes(freed)
+                        ));
+                    }
                 }
             }
             Err(msg) => {
@@ -445,6 +474,9 @@ pub struct ExplorerState {
     /// Latest action outcome ("trashed X", "error: ..."), shown in the
     /// footer until the next one replaces it.
     status: Option<String>,
+    /// Paths a dry run "deleted": rows stay (numbers unchanged) but render
+    /// with a "(would trash)" mark.
+    would_trash: std::collections::HashSet<PathBuf>,
 }
 
 fn build_rows(node: &DirNode, sort_mode: SortMode) -> Vec<Row> {
@@ -529,6 +561,7 @@ impl ExplorerState {
             large_files: false,
             now,
             status: None,
+            would_trash: std::collections::HashSet::new(),
         }
     }
 
@@ -542,6 +575,14 @@ impl ExplorerState {
 
     pub fn status(&self) -> Option<&str> {
         self.status.as_deref()
+    }
+
+    pub fn mark_would_trash(&mut self, path: PathBuf) {
+        self.would_trash.insert(path);
+    }
+
+    pub fn is_marked_would_trash(&self, path: &Path) -> bool {
+        self.would_trash.contains(path)
     }
 
     pub fn is_large_files_view(&self) -> bool {
@@ -818,6 +859,7 @@ fn render_header(frame: &mut Frame, area: Rect, state: &ExplorerState) {
 
 fn render_body(frame: &mut Frame, area: Rect, state: &ExplorerState) {
     let node = state.current_node();
+    let current = state.current_path();
     let name_width = state.rows.iter().map(|r| r.name.len()).max().unwrap_or(0);
     let lines: Vec<Line> = state
         .rows
@@ -833,8 +875,15 @@ fn render_body(frame: &mut Frame, area: Rect, state: &ExplorerState) {
             };
             let marker = if i == state.cursor { ">" } else { " " };
             let age = format_age(row.mtime, state.now);
+            let would_trash = if matches!(row.kind, RowKind::Dir(_))
+                && state.is_marked_would_trash(&current.join(&row.name))
+            {
+                "  (would trash)"
+            } else {
+                ""
+            };
             Line::from(format!(
-                "{marker} {:name_width$}  {:<9}  {:>6}  {}  {age}",
+                "{marker} {:name_width$}  {:<9}  {:>6}  {}  {age}{would_trash}",
                 row.name,
                 humanize_bytes(row.bytes),
                 format!("{pct:.1}%"),
@@ -855,8 +904,13 @@ fn render_large_files_body(frame: &mut Frame, area: Rect, state: &ExplorerState)
         .map(|(i, file)| {
             let marker = if i == state.cursor { ">" } else { " " };
             let age = format_age(file.mtime, state.now);
+            let would_trash = if state.is_marked_would_trash(&file.path) {
+                "  (would trash)"
+            } else {
+                ""
+            };
             Line::from(format!(
-                "{marker} {:<9}  {age:<6}  {}",
+                "{marker} {:<9}  {age:<6}  {}{would_trash}",
                 humanize_bytes(file.bytes),
                 file.path.display()
             ))
@@ -1817,5 +1871,79 @@ mod tests {
         let s = state();
         let text = full_text(&draw(&s));
         assert!(text.contains("d delete"));
+    }
+
+    // --- dry run ---
+
+    #[test]
+    fn test_dry_run_trash_marks_row_instead_of_removing_it() {
+        let mut session = browsing_session();
+        session.set_dry_run(true);
+        let mut effector = FakeEffector::trash_ok(8000);
+        session.request_delete();
+        session.confirm_trash(&mut effector);
+
+        // The effector was still driven (it journals dry_run=true)...
+        assert_eq!(effector.trash_calls, vec![PathBuf::from("/scan/root/big")]);
+        // ...but nothing about the tree changed except the mark.
+        let explorer = session.explorer().unwrap();
+        assert!(explorer.rows.iter().any(|r| r.name == "big"));
+        assert_eq!(explorer.root.bytes, 12000);
+        assert!(explorer.is_marked_would_trash(Path::new("/scan/root/big")));
+        assert!(explorer.status().unwrap().contains("would trash"));
+        assert!(explorer.status().unwrap().contains("dry run"));
+    }
+
+    #[test]
+    fn test_dry_run_permanent_delete_marks_row_instead_of_removing_it() {
+        let mut session = browsing_session();
+        session.set_dry_run(true);
+        let mut effector = FakeEffector::permanent(Ok(8000));
+        session.request_delete();
+        session.confirm_trash(&mut effector); // cross-fs -> permanent prompt
+        for c in "delete".chars() {
+            session.prompt_input_push(c);
+        }
+        session.confirm_permanent(&mut effector);
+
+        let explorer = session.explorer().unwrap();
+        assert!(explorer.rows.iter().any(|r| r.name == "big"));
+        assert_eq!(explorer.root.bytes, 12000);
+        assert!(explorer.is_marked_would_trash(Path::new("/scan/root/big")));
+        assert!(explorer.status().unwrap().contains("dry run"));
+    }
+
+    #[test]
+    fn test_render_marks_would_trash_dir_row() {
+        let mut session = browsing_session();
+        session.set_dry_run(true);
+        let mut effector = FakeEffector::trash_ok(8000);
+        session.request_delete();
+        session.confirm_trash(&mut effector);
+        let text = full_text(&draw_session(&session));
+        let big_row = text.lines().find(|l| l.contains("> big")).unwrap();
+        assert!(big_row.contains("(would trash)"));
+    }
+
+    #[test]
+    fn test_render_marks_would_trash_large_file_row() {
+        let top_files = vec![LargeFile {
+            path: PathBuf::from("/scan/root/big/f1.bin"),
+            bytes: 5000,
+            mtime: 1000,
+        }];
+        let mut session = ExplorerSession::new(totals(), 10_000);
+        session.set_dry_run(true);
+        session.on_finished(sample_root(), top_files, true);
+        session.explorer_mut().unwrap().toggle_large_files();
+        let mut effector = FakeEffector::trash_ok(5000);
+        session.request_delete();
+        session.confirm_trash(&mut effector);
+
+        let explorer = session.explorer().unwrap();
+        assert_eq!(explorer.top_files.len(), 1, "dry run must not remove it");
+        let text = full_text(&draw_session(&session));
+        let row = text.lines().find(|l| l.contains("f1.bin")).unwrap();
+        assert!(row.contains("(would trash)"));
     }
 }

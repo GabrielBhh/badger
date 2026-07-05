@@ -56,6 +56,13 @@ fn validated_target(ctx: &Ctx, path: Option<PathBuf>) -> anyhow::Result<PathBuf>
 }
 
 pub fn run(ctx: &Ctx, path: Option<PathBuf>, mode: Mode) -> anyhow::Result<AnalyzeOutput> {
+    // Non-tty/--json behavior (below) is unchanged; the explorer only shows
+    // up for a real, interactive `badger analyze` (`Mode::Human` already
+    // implies a tty stdout — same gating as clean/purge).
+    if mode == Mode::Human && std::io::stderr().is_terminal() {
+        return run_interactive(ctx, path);
+    }
+
     let target = validated_target(ctx, path)?;
 
     let (tx, rx) = mpsc::channel::<(u64, u64)>();
@@ -127,11 +134,20 @@ pub fn run_interactive(ctx: &Ctx, path: Option<PathBuf>) -> anyhow::Result<Analy
 
     let now = jiff::Timestamp::now().as_second();
     let mut session = explorer::ExplorerSession::new(totals, now);
+    session.set_dry_run(ctx.dry_run);
     let run_id = jiff::Timestamp::now().to_string();
-    let mut effector = RealAnalyzeEffector {
-        ctx,
-        start: target.clone(),
-        run_id: run_id.clone(),
+    let mut effector: Box<dyn explorer::AnalyzeEffector> = if ctx.dry_run {
+        Box::new(DryRunAnalyzeEffector {
+            ctx,
+            start: target.clone(),
+            run_id: run_id.clone(),
+        })
+    } else {
+        Box::new(RealAnalyzeEffector {
+            ctx,
+            start: target.clone(),
+            run_id: run_id.clone(),
+        })
     };
 
     let mut terminal = tui::init_terminal()?;
@@ -141,7 +157,7 @@ pub fn run_interactive(ctx: &Ctx, path: Option<PathBuf>) -> anyhow::Result<Analy
         &rx,
         scan_thread,
         &cancel,
-        &mut effector,
+        effector.as_mut(),
     );
     // Leave the alternate screen before printing anything: warnings and the
     // final summary both need a normal, scrollable terminal.
@@ -155,8 +171,9 @@ pub fn run_interactive(ctx: &Ctx, path: Option<PathBuf>) -> anyhow::Result<Analy
         eprintln!("warning: skipped mount: {}", p.display());
     }
 
+    let (records, _) = Journal::new(&ctx.state_dir).read_all()?;
     Ok(AnalyzeOutput {
-        rendered: String::new(),
+        rendered: session_summary(&records, &run_id),
     })
 }
 
@@ -251,6 +268,39 @@ fn drive_explorer(
     }
 }
 
+/// Builds one journal record for an explorer delete action.
+#[allow(clippy::too_many_arguments)]
+fn analyze_record(
+    run_id: &str,
+    rule: &str,
+    action: &str,
+    path: &Path,
+    dry_run: bool,
+    bytes: u64,
+    outcome: String,
+) -> Record {
+    Record::now(
+        run_id.to_string(),
+        "analyze".to_string(),
+        rule.to_string(),
+        action.to_string(),
+        None,
+        Some(vec![path.display().to_string()]),
+        false,
+        dry_run,
+        bytes,
+        outcome,
+    )
+}
+
+/// Writes a record to the journal; a failed audit-trail write must not fail
+/// the delete it describes (matches `analyze::trash`'s convention).
+fn journal_or_warn(ctx: &Ctx, record: &Record) {
+    if let Err(e) = Journal::new(&ctx.state_dir).append(record) {
+        eprintln!("warning: failed to record audit trail: {e:#}");
+    }
+}
+
 /// The real delete seam behind the explorer's `d` key: trash via the
 /// engine's `trash_path` (which validates and journals itself), and — for
 /// cross-filesystem sources only — a validated, journaled permanent delete
@@ -261,31 +311,6 @@ struct RealAnalyzeEffector<'a> {
     /// deletes are allowed inside.
     start: PathBuf,
     run_id: String,
-}
-
-impl RealAnalyzeEffector<'_> {
-    fn record(&self, path: &Path, bytes: u64, outcome: String) -> Record {
-        Record::now(
-            self.run_id.clone(),
-            "analyze".to_string(),
-            "analyze.delete".to_string(),
-            "delete".to_string(),
-            None,
-            Some(vec![path.display().to_string()]),
-            false,
-            false,
-            bytes,
-            outcome,
-        )
-    }
-
-    /// Writes a record to the journal; a failed audit-trail write must not
-    /// fail the delete it describes (matches `analyze::trash`'s convention).
-    fn journal_or_warn(&self, record: &Record) {
-        if let Err(e) = Journal::new(&self.ctx.state_dir).append(record) {
-            eprintln!("warning: failed to record audit trail: {e:#}");
-        }
-    }
 }
 
 impl explorer::AnalyzeEffector for RealAnalyzeEffector<'_> {
@@ -300,17 +325,29 @@ impl explorer::AnalyzeEffector for RealAnalyzeEffector<'_> {
     }
 
     fn delete_permanent(&mut self, path: &Path) -> Result<u64, String> {
+        let record = |bytes, outcome| {
+            analyze_record(
+                &self.run_id,
+                "analyze.delete",
+                "delete",
+                path,
+                false,
+                bytes,
+                outcome,
+            )
+        };
+
         let env = SafetyEnv::from_system(self.ctx).map_err(|e| format!("{e:#}"))?;
         if let Err(refusal) =
             validate_deletable(path, std::slice::from_ref(&self.start), Tier::User, &env)
         {
-            self.journal_or_warn(&self.record(path, 0, format!("refused: {refusal}")));
+            journal_or_warn(self.ctx, &record(0, format!("refused: {refusal}")));
             return Err(format!("refused: {refusal}"));
         }
 
         let report = delete_tree(path);
         if report.errors.is_empty() {
-            self.journal_or_warn(&self.record(path, report.bytes_freed, "ok".to_string()));
+            journal_or_warn(self.ctx, &record(report.bytes_freed, "ok".to_string()));
             Ok(report.bytes_freed)
         } else {
             let detail = report
@@ -319,13 +356,102 @@ impl explorer::AnalyzeEffector for RealAnalyzeEffector<'_> {
                 .map(|(p, e)| format!("{}: {e}", p.display()))
                 .collect::<Vec<_>>()
                 .join("; ");
-            self.journal_or_warn(&self.record(
-                path,
-                report.bytes_freed,
-                format!("error: {detail}"),
-            ));
+            journal_or_warn(
+                self.ctx,
+                &record(report.bytes_freed, format!("error: {detail}")),
+            );
             Err(detail)
         }
+    }
+}
+
+/// `--dry-run` seam: applies the same safety validation as a real delete so
+/// a protected path still refuses, journals `dry_run: true`, and reports
+/// the estimated size — but never touches the filesystem. The session marks
+/// the row "(would trash)" instead of removing it.
+struct DryRunAnalyzeEffector<'a> {
+    ctx: &'a Ctx,
+    start: PathBuf,
+    run_id: String,
+}
+
+impl DryRunAnalyzeEffector<'_> {
+    fn validate_and_journal(
+        &self,
+        path: &Path,
+        rule: &str,
+        action: &str,
+        would: &str,
+    ) -> Result<u64, String> {
+        let record =
+            |bytes, outcome| analyze_record(&self.run_id, rule, action, path, true, bytes, outcome);
+        let env = SafetyEnv::from_system(self.ctx).map_err(|e| format!("{e:#}"))?;
+        if let Err(refusal) =
+            validate_deletable(path, std::slice::from_ref(&self.start), Tier::User, &env)
+        {
+            journal_or_warn(self.ctx, &record(0, format!("refused: {refusal}")));
+            return Err(format!("refused: {refusal}"));
+        }
+        let bytes = crate::util::dirsize::dir_size(path);
+        journal_or_warn(self.ctx, &record(bytes, would.to_string()));
+        Ok(bytes)
+    }
+}
+
+impl explorer::AnalyzeEffector for DryRunAnalyzeEffector<'_> {
+    fn trash(&mut self, path: &Path) -> Result<u64, explorer::TrashError> {
+        self.validate_and_journal(path, "analyze.trash", "trash", "would trash")
+            .map_err(explorer::TrashError::Failed)
+    }
+
+    fn delete_permanent(&mut self, path: &Path) -> Result<u64, String> {
+        self.validate_and_journal(path, "analyze.delete", "delete", "would delete")
+    }
+}
+
+/// One line summarizing what this session's journal records say happened,
+/// for printing once the terminal is back to normal. Empty when nothing
+/// was acted on.
+fn session_summary(records: &[Record], run_id: &str) -> String {
+    let mut trashed = 0usize;
+    let mut deleted = 0usize;
+    let mut would = 0usize;
+    let mut bytes = 0u64;
+    for r in records.iter().filter(|r| r.run_id == run_id) {
+        match (r.action.as_str(), r.outcome.as_str()) {
+            ("trash", "ok") => {
+                trashed += 1;
+                bytes += r.bytes_freed;
+            }
+            ("delete", "ok") => {
+                deleted += 1;
+                bytes += r.bytes_freed;
+            }
+            (_, outcome) if outcome.starts_with("would") => {
+                would += 1;
+                bytes += r.bytes_freed;
+            }
+            _ => {}
+        }
+    }
+
+    if would > 0 {
+        format!(
+            "Would trash {would} item(s), freeing {} (dry run — nothing moved; recorded in history).",
+            output::humanize_bytes(bytes)
+        )
+    } else if deleted > 0 {
+        format!(
+            "Trashed {trashed} item(s), deleted {deleted} permanently, freed {}.",
+            output::humanize_bytes(bytes)
+        )
+    } else if trashed > 0 {
+        format!(
+            "Trashed {trashed} item(s), freed {} (recoverable from the trash).",
+            output::humanize_bytes(bytes)
+        )
+    } else {
+        String::new()
     }
 }
 
@@ -653,5 +779,138 @@ Largest files: (none)";
         let (records, _) = Journal::new(&f.ctx.state_dir).read_all().unwrap();
         assert_eq!(records.len(), 1);
         assert!(records[0].outcome.starts_with("refused:"));
+    }
+
+    // --- DryRunAnalyzeEffector ---
+
+    fn dry_run_effector<'a>(f: &'a Fixture, start: &Path) -> DryRunAnalyzeEffector<'a> {
+        DryRunAnalyzeEffector {
+            ctx: &f.ctx,
+            start: start.to_path_buf(),
+            run_id: "run-1".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_dry_run_effector_trash_journals_without_moving_anything() {
+        let f = fixture();
+        let stuff = f.ctx.home.join("stuff");
+        std::fs::create_dir_all(&stuff).unwrap();
+        let target = stuff.join("junk.txt");
+        std::fs::write(&target, vec![0u8; 4096]).unwrap();
+
+        let mut effector = dry_run_effector(&f, &f.ctx.home);
+        let bytes = effector.trash(&target).unwrap();
+
+        assert!(bytes > 0);
+        assert!(target.exists(), "dry run must not move anything");
+        assert!(!f.ctx.home.join(".local/share/Trash").exists());
+        let (records, _) = Journal::new(&f.ctx.state_dir).read_all().unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].dry_run);
+        assert_eq!(records[0].action, "trash");
+        assert_eq!(records[0].outcome, "would trash");
+        assert!(records[0].bytes_freed > 0);
+    }
+
+    #[test]
+    fn test_dry_run_effector_still_refuses_protected_paths() {
+        let f = fixture();
+        let ssh = f.ctx.home.join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let target = ssh.join("id_rsa");
+        std::fs::write(&target, b"secret").unwrap();
+
+        let mut effector = dry_run_effector(&f, &f.ctx.home);
+        let err = effector.trash(&target).unwrap_err();
+
+        assert!(matches!(err, TrashError::Failed(ref msg) if msg.contains("refused")));
+        let (records, _) = Journal::new(&f.ctx.state_dir).read_all().unwrap();
+        assert!(records[0].outcome.starts_with("refused:"));
+        assert!(records[0].dry_run);
+    }
+
+    #[test]
+    fn test_dry_run_effector_delete_permanent_journals_would_delete() {
+        let f = fixture();
+        let stuff = f.ctx.home.join("stuff");
+        let olddir = stuff.join("olddir");
+        std::fs::create_dir_all(&olddir).unwrap();
+        std::fs::write(olddir.join("f.txt"), vec![0u8; 4096]).unwrap();
+
+        let mut effector = dry_run_effector(&f, &f.ctx.home);
+        let bytes = effector.delete_permanent(&olddir).unwrap();
+
+        assert!(bytes > 0);
+        assert!(olddir.exists());
+        let (records, _) = Journal::new(&f.ctx.state_dir).read_all().unwrap();
+        assert_eq!(records[0].outcome, "would delete");
+        assert!(records[0].dry_run);
+    }
+
+    // --- session_summary ---
+
+    fn record(action: &str, outcome: &str, bytes: u64, dry_run: bool, run_id: &str) -> Record {
+        Record::now(
+            run_id.to_string(),
+            "analyze".to_string(),
+            "analyze.trash".to_string(),
+            action.to_string(),
+            None,
+            None,
+            false,
+            dry_run,
+            bytes,
+            outcome.to_string(),
+        )
+    }
+
+    #[test]
+    fn test_session_summary_empty_when_nothing_was_acted_on() {
+        assert_eq!(session_summary(&[], "run-1"), "");
+        let records = vec![record(
+            "trash",
+            "refused: protected path",
+            0,
+            false,
+            "run-1",
+        )];
+        assert_eq!(session_summary(&records, "run-1"), "");
+    }
+
+    #[test]
+    fn test_session_summary_counts_only_this_runs_records() {
+        let records = vec![
+            record("trash", "ok", 2048, false, "run-1"),
+            record("trash", "ok", 4096, false, "other-run"),
+        ];
+        assert_eq!(
+            session_summary(&records, "run-1"),
+            "Trashed 1 item(s), freed 2.0 KiB (recoverable from the trash)."
+        );
+    }
+
+    #[test]
+    fn test_session_summary_mentions_permanent_deletes() {
+        let records = vec![
+            record("trash", "ok", 2048, false, "run-1"),
+            record("delete", "ok", 2048, false, "run-1"),
+        ];
+        assert_eq!(
+            session_summary(&records, "run-1"),
+            "Trashed 1 item(s), deleted 1 permanently, freed 4.0 KiB."
+        );
+    }
+
+    #[test]
+    fn test_session_summary_dry_run_says_nothing_moved() {
+        let records = vec![
+            record("trash", "would trash", 2048, true, "run-1"),
+            record("delete", "would delete", 2048, true, "run-1"),
+        ];
+        assert_eq!(
+            session_summary(&records, "run-1"),
+            "Would trash 2 item(s), freeing 4.0 KiB (dry run — nothing moved; recorded in history)."
+        );
     }
 }

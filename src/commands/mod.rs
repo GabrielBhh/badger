@@ -114,7 +114,11 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
             )?;
             let mode = crate::output::current(cli.json);
             let output = analyze::run(&ctx, path, mode)?;
-            println!("{}", output.rendered);
+            // The interactive explorer renders nothing when the session
+            // made no deletions — don't print a blank stdout line then.
+            if !output.rendered.is_empty() {
+                println!("{}", output.rendered);
+            }
             Ok(())
         }
     }

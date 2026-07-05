@@ -6,9 +6,10 @@ fn main() {
 
     let yes = match &cli.command {
         Command::Clean { yes } | Command::Purge { yes } => Some(*yes),
-        // `uninstall` has no `--yes` shortcut — it's always attempting the
-        // interactive path unless mode/tty checks inside it say otherwise.
-        Command::Uninstall => Some(false),
+        // `uninstall` and `analyze` have no `--yes` shortcut — they're
+        // always attempting the interactive path unless mode/tty checks
+        // inside them say otherwise.
+        Command::Uninstall | Command::Analyze { .. } => Some(false),
         _ => None,
     };
     if let Some(yes) = yes
