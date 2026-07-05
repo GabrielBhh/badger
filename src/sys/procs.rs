@@ -89,6 +89,11 @@ pub fn sample_all(ctx: &Ctx) -> Vec<ProcSample> {
 /// Accumulates successive `ProcSample` snapshots into a per-pid rolling
 /// window of CPU percentages, so `sustained_hogs` can tell "briefly spiked"
 /// apart from "pegged the whole window".
+///
+/// Known tradeoff: samples are matched by pid alone (no starttime check),
+/// so a pid recycled between two samples deltas the new process's ticks
+/// against the old one's — `saturating_sub` clamps that to an undercount
+/// for one tick, after which the history is accurate again.
 #[derive(Debug, Default)]
 pub struct ProcCpuTracker {
     window: usize,

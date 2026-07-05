@@ -60,14 +60,30 @@ pub struct StatusReport {
     pub failed_units: Option<usize>,
 }
 
+/// The failed-systemd-units count for a report. A sandboxed Ctx never
+/// shells out for real (see core::runner::runner_for); skip the call
+/// entirely rather than exercising the FakeRunner-errors-without-canned-
+/// output path on every status run.
+pub(crate) fn fetch_failed_units(ctx: &Ctx) -> Option<usize> {
+    if ctx.sandboxed {
+        None
+    } else {
+        cachyos::failed_units(ctx)
+    }
+}
+
 /// Builds the full status report from a pair of samples `interval_secs`
 /// apart. Split out from `run` so tests can drive it with fabricated
-/// samples instead of a real 500ms sleep.
+/// samples instead of a real 500ms sleep. `failed_units` is passed in
+/// rather than fetched here because it forks `systemctl`: the one-shot
+/// path fetches it once, the live dashboard refreshes it only every few
+/// ticks through the session's cache.
 pub(crate) fn build_report(
     ctx: &Ctx,
     before: &Samples,
     after: &Samples,
     interval_secs: f64,
+    failed_units: Option<usize>,
 ) -> anyhow::Result<StatusReport> {
     let cpu_pcts = cpu::cpu_percent(&before.cpu, &after.cpu);
     let cpu_total_pct = cpu_pcts.first().copied().unwrap_or(0.0);
@@ -104,14 +120,6 @@ pub(crate) fn build_report(
     let battery = power::read_battery(ctx);
     let kernel = cachyos::kernel_release(ctx).unwrap_or_default();
     let scx = cachyos::scx_scheduler(ctx);
-    // A sandboxed Ctx never shells out for real (see core::runner::runner_for);
-    // skip the call entirely rather than exercising the FakeRunner-errors-
-    // without-canned-output path on every status run.
-    let failed_units = if ctx.sandboxed {
-        None
-    } else {
-        cachyos::failed_units(ctx)
-    };
 
     let health_inputs = health::HealthInputs {
         psi_cpu_avg10: psi_all.cpu.map(|p| p.some.avg10),
@@ -150,7 +158,13 @@ pub fn run(ctx: &Ctx, mode: Mode) -> anyhow::Result<StatusOutput> {
     let before = take_samples(ctx);
     std::thread::sleep(SAMPLE_INTERVAL);
     let after = take_samples(ctx);
-    let report = build_report(ctx, &before, &after, SAMPLE_INTERVAL.as_secs_f64())?;
+    let report = build_report(
+        ctx,
+        &before,
+        &after,
+        SAMPLE_INTERVAL.as_secs_f64(),
+        fetch_failed_units(ctx),
+    )?;
 
     let rendered = match mode {
         Mode::Json => serde_json::to_string(&report)?,
@@ -231,7 +245,10 @@ fn drive_dashboard(
         }
 
         let curr = take_samples(ctx);
-        let report = build_report(ctx, &prev, &curr, TICK_INTERVAL.as_secs_f64())?;
+        // failed_units forks systemctl, so the session caches it and only
+        // re-fetches every 10th tick instead of once a second.
+        let failed_units = session.failed_units_for_tick(|| fetch_failed_units(ctx));
+        let report = build_report(ctx, &prev, &curr, TICK_INTERVAL.as_secs_f64(), failed_units)?;
         let proc_sample = procs::sample_all(ctx);
         session.on_tick(&report, proc_sample, TICK_INTERVAL.as_secs_f64());
         prev = curr;
@@ -442,7 +459,7 @@ mod tests {
         write_system(&ctx, 1500, 9000, 1100, 3000);
         let after = take_samples(&ctx);
 
-        let report = build_report(&ctx, &before, &after, 2.0).unwrap();
+        let report = build_report(&ctx, &before, &after, 2.0, fetch_failed_units(&ctx)).unwrap();
 
         // total delta = 500 (busy) + 0 (idle unchanged) = 500; busy delta 500
         // -> 100%.
@@ -479,7 +496,7 @@ mod tests {
         let before = take_samples(&ctx);
         let after = take_samples(&ctx);
 
-        let report = build_report(&ctx, &before, &after, 1.0).unwrap();
+        let report = build_report(&ctx, &before, &after, 1.0, None).unwrap();
         let json = serde_json::to_string(&report).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["health_score"], 100);
@@ -493,7 +510,7 @@ mod tests {
         write_system(&ctx, 0, 0, 0, 0);
         let before = take_samples(&ctx);
         let after = take_samples(&ctx);
-        let report = build_report(&ctx, &before, &after, 1.0).unwrap();
+        let report = build_report(&ctx, &before, &after, 1.0, None).unwrap();
 
         let rendered = render_human(&report);
         assert!(rendered.contains("Health: 100/100"));

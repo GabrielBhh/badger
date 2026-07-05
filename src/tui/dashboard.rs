@@ -145,6 +145,12 @@ impl Default for DashboardState {
     }
 }
 
+/// How many ticks a fetched failed-units count is reused before the session
+/// asks for a fresh one. The query forks `systemctl`; re-running it every
+/// 1-second tick would spawn a subprocess per second for a value that
+/// rarely changes.
+const FAILED_UNITS_REFRESH_TICKS: u64 = 10;
+
 /// Ties `DashboardState` to a `ProcCpuTracker` behind one message-seam
 /// `on_tick`, mirroring `explorer::ExplorerSession`: the caller does all the
 /// I/O (sampling `/proc`, the real 1-second loop lives in
@@ -154,6 +160,8 @@ pub struct DashboardSession {
     tracker: ProcCpuTracker,
     threshold_pct: f64,
     window_samples: usize,
+    failed_units_ticks: u64,
+    failed_units_cache: Option<usize>,
 }
 
 impl DashboardSession {
@@ -166,11 +174,31 @@ impl DashboardSession {
             tracker: ProcCpuTracker::new(window_samples),
             threshold_pct,
             window_samples,
+            failed_units_ticks: 0,
+            failed_units_cache: None,
         }
     }
 
     pub fn state(&self) -> &DashboardState {
         &self.state
+    }
+
+    /// The failed-units count for this tick: calls `fetch` on the first
+    /// tick and every `FAILED_UNITS_REFRESH_TICKS`th after, reusing the
+    /// cached value in between so the dashboard doesn't fork `systemctl`
+    /// once a second.
+    pub fn failed_units_for_tick(
+        &mut self,
+        fetch: impl FnOnce() -> Option<usize>,
+    ) -> Option<usize> {
+        if self
+            .failed_units_ticks
+            .is_multiple_of(FAILED_UNITS_REFRESH_TICKS)
+        {
+            self.failed_units_cache = fetch();
+        }
+        self.failed_units_ticks += 1;
+        self.failed_units_cache
     }
 
     /// One tick: folds `proc_sample` into the CPU-hog tracker, then folds
@@ -695,6 +723,35 @@ mod tests {
         session.on_tick(&report(), vec![proc_sample(1, "hog", 180, 0)], 1.0);
         session.on_tick(&report(), vec![proc_sample(1, "hog", 270, 0)], 1.0);
         assert_eq!(session.state().hogs, vec![(1, "hog".to_string(), 90.0)]);
+    }
+
+    #[test]
+    fn test_failed_units_fetches_on_tick_1_and_11_not_between() {
+        // The failed-units query forks systemctl; the session must run it
+        // on the first tick, reuse the cached value for ticks 2-10, and
+        // refresh again on tick 11.
+        let mut session = DashboardSession::new(50.0, 3);
+        let mut calls = 0u32;
+        for _ in 0..10 {
+            session.failed_units_for_tick(|| {
+                calls += 1;
+                Some(1)
+            });
+        }
+        assert_eq!(calls, 1);
+        session.failed_units_for_tick(|| {
+            calls += 1;
+            Some(1)
+        });
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn test_failed_units_reuses_cached_value_between_refreshes() {
+        let mut session = DashboardSession::new(50.0, 3);
+        assert_eq!(session.failed_units_for_tick(|| Some(3)), Some(3));
+        // Tick 2 must return the tick-1 value without consulting the fetch.
+        assert_eq!(session.failed_units_for_tick(|| Some(99)), Some(3));
     }
 
     #[test]
