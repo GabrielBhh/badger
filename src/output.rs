@@ -1,1 +1,44 @@
-// Slice 2 will fill this in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Human,
+    Json,
+}
+
+pub fn decide(flag_json: bool, env_json: bool, stdout_is_tty: bool) -> Mode {
+    if flag_json || env_json || !stdout_is_tty {
+        Mode::Json
+    } else {
+        Mode::Human
+    }
+}
+
+pub fn current(flag_json: bool) -> Mode {
+    use std::io::IsTerminal;
+    let env_json = std::env::var_os("BADGER_JSON").as_deref() == Some(std::ffi::OsStr::new("1"));
+    decide(flag_json, env_json, std::io::stdout().is_terminal())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_flag_forces_json() {
+        assert_eq!(decide(true, false, true), Mode::Json);
+    }
+
+    #[test]
+    fn test_env_forces_json() {
+        assert_eq!(decide(false, true, true), Mode::Json);
+    }
+
+    #[test]
+    fn test_non_tty_forces_json() {
+        assert_eq!(decide(false, false, false), Mode::Json);
+    }
+
+    #[test]
+    fn test_tty_no_flags_is_human() {
+        assert_eq!(decide(false, false, true), Mode::Human);
+    }
+}
