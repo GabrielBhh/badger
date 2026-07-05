@@ -15,8 +15,27 @@ pub enum Applicability {
     /// `name` must be found on `PATH` (or in `Ctx::available_commands` when
     /// sandboxed).
     CommandExists(&'static str),
+    /// At least one of these commands must be found (e.g. `podman` or
+    /// `docker`); the rule itself decides which one to prefer.
+    CommandExistsAny(&'static [&'static str]),
     /// `~`-prefixed or root-relative path that must exist.
     PathExists(&'static str),
+}
+
+/// Whether `name` is available: on `PATH` for a real run, or in
+/// `Ctx::available_commands` while sandboxed (tests never touch the real
+/// `PATH`). Shared by `scan::is_applicable` and any detector that needs to
+/// pick between several possible commands (e.g. `podman` vs `docker`).
+pub fn command_exists(name: &str, ctx: &Ctx) -> bool {
+    if ctx.sandboxed {
+        return ctx
+            .available_commands
+            .as_ref()
+            .is_some_and(|cmds| cmds.iter().any(|c| c == name));
+    }
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+        .unwrap_or(false)
 }
 
 /// How a rule finds its candidates.
@@ -142,6 +161,7 @@ mod tests {
             config: Config::default(),
             sandboxed: true,
             available_commands: None,
+            fake_command_output: None,
         }
     }
 

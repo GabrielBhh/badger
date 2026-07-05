@@ -90,6 +90,7 @@ mod tests {
             config: Config::default(),
             sandboxed: true,
             available_commands: None,
+            fake_command_output: None,
         };
         Fixture {
             _sandbox: sandbox,

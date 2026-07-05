@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::Context;
 
 use crate::config::{self, Config};
+use crate::core::runner::CmdOutput;
 
 #[derive(Debug, Clone, Default)]
 pub struct EnvOverrides {
@@ -39,6 +41,11 @@ pub struct Ctx {
     /// should treat as present. Only consulted while `sandboxed`; populated
     /// from the comma-separated `BADGER_COMMANDS` env var.
     pub available_commands: Option<Vec<String>>,
+    /// Test-only canned output for command-based detectors (see
+    /// `core::runner::runner_for`), keyed by exact argv. Only consulted
+    /// while `sandboxed` — a command-based detector must never shell out for
+    /// real in a test.
+    pub fake_command_output: Option<HashMap<Vec<String>, CmdOutput>>,
 }
 
 impl Ctx {
@@ -101,6 +108,7 @@ impl Ctx {
             config,
             sandboxed,
             available_commands,
+            fake_command_output: None,
         })
     }
 }

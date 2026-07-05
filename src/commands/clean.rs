@@ -522,6 +522,7 @@ mod tests {
             config: crate::config::Config::default(),
             sandboxed: true,
             available_commands: None,
+            fake_command_output: None,
         };
         ExecFixture {
             _sandbox: sandbox,

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::config::Config;
 use crate::core::item::{Candidate, Group};
 use crate::ctx::Ctx;
-use crate::rules::{Action, Applicability, Detector, Rule, expand_path_spec};
+use crate::rules::{Action, Applicability, Detector, Rule, command_exists, expand_path_spec};
 use crate::safety::protected::{SafetyEnv, Tier, validate_deletable};
 use crate::safety::whitelist::Whitelist;
 use crate::util::dirsize::dir_size;
@@ -29,20 +29,11 @@ fn is_applicable(applicable: Applicability, ctx: &Ctx) -> bool {
     match applicable {
         Applicability::Always => true,
         Applicability::CommandExists(name) => command_exists(name, ctx),
+        Applicability::CommandExistsAny(names) => {
+            names.iter().any(|name| command_exists(name, ctx))
+        }
         Applicability::PathExists(spec) => expand_path_spec(spec, ctx).exists(),
     }
-}
-
-fn command_exists(name: &str, ctx: &Ctx) -> bool {
-    if ctx.sandboxed {
-        return ctx
-            .available_commands
-            .as_ref()
-            .is_some_and(|cmds| cmds.iter().any(|c| c == name));
-    }
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
-        .unwrap_or(false)
 }
 
 fn scan_rule(
@@ -210,6 +201,7 @@ mod tests {
             config: Config::default(),
             sandboxed: true,
             available_commands: None,
+            fake_command_output: None,
         };
         Fixture {
             _sandbox: sandbox,
@@ -379,6 +371,43 @@ mod tests {
         };
         let groups = scan(&[rule], &f.ctx, &f.ctx.config.clone(), &empty_whitelist()).unwrap();
         assert_eq!(groups.len(), 1);
+    }
+
+    #[test]
+    fn test_scan_command_exists_any_matches_on_the_second_of_several_names() {
+        let mut f = fixture();
+        f.ctx.available_commands = Some(vec!["docker".to_string()]);
+        let rule = Rule {
+            id: "test.podman_or_docker",
+            title: "Needs podman or docker",
+            risk: Risk::Moderate,
+            requires_sudo: false,
+            applicable: Applicability::CommandExistsAny(&["podman", "docker"]),
+            allowed_prefixes: &[],
+            detector: Detector::Globs(&[]),
+            action: Action::DeletePaths,
+            notes: "",
+        };
+        let groups = scan(&[rule], &f.ctx, &f.ctx.config.clone(), &empty_whitelist()).unwrap();
+        assert_eq!(groups.len(), 1);
+    }
+
+    #[test]
+    fn test_scan_command_exists_any_omits_rule_when_none_present() {
+        let f = fixture();
+        let rule = Rule {
+            id: "test.podman_or_docker_absent",
+            title: "Needs podman or docker",
+            risk: Risk::Moderate,
+            requires_sudo: false,
+            applicable: Applicability::CommandExistsAny(&["podman", "docker"]),
+            allowed_prefixes: &[],
+            detector: Detector::Globs(&[]),
+            action: Action::DeletePaths,
+            notes: "",
+        };
+        let groups = scan(&[rule], &f.ctx, &f.ctx.config.clone(), &empty_whitelist()).unwrap();
+        assert!(groups.is_empty());
     }
 
     #[test]
