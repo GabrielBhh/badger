@@ -6,8 +6,10 @@
 pub mod cachyos;
 pub mod cpu;
 pub mod disk;
+pub mod health;
 pub mod hwmon;
 pub mod mem;
 pub mod net;
 pub mod power;
+pub mod procs;
 pub mod psi;
