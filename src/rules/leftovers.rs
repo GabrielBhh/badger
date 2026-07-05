@@ -48,6 +48,7 @@ pub fn rules() -> Vec<Rule> {
         id: "leftovers.orphan_configs",
         title: "Orphaned app leftovers (experimental)",
         risk: Risk::Risky,
+        // Must stay false: a heuristic guess must never gain root-deletion trust via the helper's registry(true).
         requires_sudo: false,
         applicable: Applicability::CommandExists("pacman"),
         allowed_prefixes: &["~/.config", "~/.local/share", "~/.cache"],

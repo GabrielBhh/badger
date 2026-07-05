@@ -126,11 +126,28 @@ pub fn list_snapshots(ctx: &Ctx, cfg: &str) -> anyhow::Result<Vec<Snapshot>> {
 /// number. Recognizes any of: `subvol=@snapshots/<N>/snapshot`,
 /// `subvol=/@snapshots/<N>/snapshot`, and the openSUSE-style `.snapshots`
 /// prefix instead of `@snapshots` (all four combinations of leading-slash x
-/// @-vs-dot-prefix). Returns None if the file is missing/unreadable or no
-/// such pattern is found.
+/// @-vs-dot-prefix). Returns None if the file is missing/unreadable, no
+/// `subvol=` token is present at all (e.g. rootflags uses `subvolid=`
+/// instead — the booted snapshot number is then unknowable from cmdline),
+/// or the `subvol=` token doesn't match the snapshot pattern.
 pub fn booted_snapshot_from_cmdline(ctx: &Ctx) -> Option<u64> {
     let text = std::fs::read_to_string(ctx.root.join("proc/cmdline")).ok()?;
-    extract_snapshot_number(&text)
+    extract_snapshot_number_from_cmdline(&text)
+}
+
+/// Scans whitespace-delimited `text` for a token containing `subvol=`
+/// (covering both a bare `subvol=...` token and `rootflags=subvol=...`
+/// combined into one token), then runs `extract_snapshot_number` on just the
+/// value after `subvol=` in that one token. Anchoring to the token this way
+/// means an unrelated argument that happens to contain "snapshots/<N>/
+/// snapshot" (e.g. some other path) is never mistaken for the boot
+/// subvolume, and a cmdline using `subvolid=` (no `subvol=` path argument at
+/// all) correctly yields `None` here regardless of anything else on the
+/// line.
+fn extract_snapshot_number_from_cmdline(text: &str) -> Option<u64> {
+    text.split_whitespace()
+        .find_map(|tok| tok.split_once("subvol=").map(|(_, value)| value))
+        .and_then(extract_snapshot_number)
 }
 
 /// Runs `btrfs subvolume get-default /` via `runner_for(ctx)` and parses the
@@ -498,6 +515,29 @@ mod tests {
     #[test]
     fn test_booted_snapshot_from_cmdline_none_when_file_missing() {
         let f = fixture();
+        assert_eq!(booted_snapshot_from_cmdline(&f.ctx), None);
+    }
+
+    #[test]
+    fn test_booted_snapshot_from_cmdline_none_when_only_subvolid_present() {
+        let f = fixture();
+        write_cmdline(&f, "BOOT_IMAGE=/vmlinuz rw rootflags=subvolid=256 quiet\n");
+        assert_eq!(booted_snapshot_from_cmdline(&f.ctx), None);
+    }
+
+    // Regression: a bare substring scan for "snapshots/" over the whole
+    // cmdline picks up any argument that happens to contain that text, even
+    // one with nothing to do with the boot subvolume (here, rootflags uses
+    // subvolid= with no subvol= path at all). The scan must be anchored to a
+    // subvol= token so this unrelated argument is ignored.
+    #[test]
+    fn test_booted_snapshot_from_cmdline_ignores_snapshot_like_substring_not_anchored_to_subvol() {
+        let f = fixture();
+        write_cmdline(
+            &f,
+            "BOOT_IMAGE=/vmlinuz rw rootflags=subvolid=256 \
+             initrd=/boot/snapshots/5/snapshot-initrd quiet\n",
+        );
         assert_eq!(booted_snapshot_from_cmdline(&f.ctx), None);
     }
 

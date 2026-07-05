@@ -99,6 +99,7 @@ pub fn helper_main<R: Read, W: Write>(mut stdin: R, mut stdout: W) -> anyhow::Re
     // Rules for ops already selected and validated upstream may include
     // experimental ones — the helper only resolves rule ids to allowed
     // prefixes, so it must know every rule that could have produced an op.
+    // (leftovers.orphan_configs' requires_sudo: false must never change — a heuristic guess must never gain root-deletion trust just by being resolvable here.)
     let rules = registry(true);
 
     for op in &manifest.ops {

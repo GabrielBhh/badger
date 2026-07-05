@@ -27,7 +27,7 @@ pub fn rules() -> Vec<Rule> {
             requires_sudo: true,
             applicable: Applicability::Fn(snapper_applicable),
             allowed_prefixes: &[],
-            detector: Detector::Fn(cleanup_detector),
+            detector: Detector::FnWithSkips(cleanup_detector),
             action: Action::CmdSelected(cleanup_cmd),
             notes: "Runs snapper's own 'number' cleanup algorithm per config, respecting each \
                     config's own retention settings — this is the recommended way to reclaim \
@@ -59,6 +59,30 @@ fn snapper_applicable(ctx: &Ctx) -> bool {
     command_exists("snapper", ctx) && ctx.config.snapshots.manage
 }
 
+/// A snapper config name must be a safe token before it's ever placed into
+/// `snapper -c <name> ...` argv: non-empty, ASCII alphanumeric/`-`/`_`/`.`
+/// only, and never starting with `-` (so it can never be mistaken for a
+/// flag). Mirrors `snap::is_valid_snap_name`'s charset-check style.
+fn is_valid_config_name(name: &str) -> bool {
+    let Some(first) = name.chars().next() else {
+        return false;
+    };
+    first != '-'
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// `(label, reason)` skip note for a config name that failed
+/// `is_valid_config_name` — reported instead of ever being offered as a
+/// candidate.
+fn invalid_config_name_skip(name: &str) -> Skip {
+    (
+        format!("snapper config {name}"),
+        "config name contains characters unsafe to pass to snapper — skipped".to_string(),
+    )
+}
+
 // --- snapshots.snapper_cleanup ---
 
 fn limine_cleanup_suffix(ctx: &Ctx) -> &'static str {
@@ -71,25 +95,29 @@ fn limine_cleanup_suffix(ctx: &Ctx) -> &'static str {
     }
 }
 
-fn cleanup_detector(ctx: &Ctx, _config: &Config) -> Vec<Candidate> {
+fn cleanup_detector(ctx: &Ctx, _config: &Config) -> DetectorResult {
     let Ok(configs) = snapper::list_configs(ctx) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let suffix = limine_cleanup_suffix(ctx);
 
-    configs
-        .into_iter()
-        .map(|cfg| {
-            let count = snapper::list_snapshots(ctx, &cfg.name)
-                .map(|snapshots| snapshots.len())
-                .unwrap_or(0);
-            let label = format!(
-                "run snapper cleanup 'number' for config {} ({count} snapshots){suffix}",
-                cfg.name
-            );
-            Candidate::new(None, label, 0, Risk::Risky)
-        })
-        .collect()
+    let mut candidates = Vec::new();
+    let mut skips = Vec::new();
+    for cfg in configs {
+        if !is_valid_config_name(&cfg.name) {
+            skips.push(invalid_config_name_skip(&cfg.name));
+            continue;
+        }
+        let count = snapper::list_snapshots(ctx, &cfg.name)
+            .map(|snapshots| snapshots.len())
+            .unwrap_or(0);
+        let label = format!(
+            "run snapper cleanup 'number' for config {} ({count} snapshots){suffix}",
+            cfg.name
+        );
+        candidates.push(Candidate::new(None, label, 0, Risk::Risky));
+    }
+    (candidates, skips)
 }
 
 /// Extracts the config name between `for config ` and the following ` (` in
@@ -173,8 +201,13 @@ fn manual_detector(ctx: &Ctx, _config: &Config) -> DetectorResult {
     };
 
     let mut candidates = Vec::new();
+    let mut skips = manual_limine_skips(ctx);
     if let Ok(configs) = snapper::list_configs(ctx) {
         for cfg in configs {
+            if !is_valid_config_name(&cfg.name) {
+                skips.push(invalid_config_name_skip(&cfg.name));
+                continue;
+            }
             let Ok(snapshots) = snapper::list_snapshots(ctx, &cfg.name) else {
                 continue;
             };
@@ -192,7 +225,7 @@ fn manual_detector(ctx: &Ctx, _config: &Config) -> DetectorResult {
         }
     }
 
-    (candidates, manual_limine_skips(ctx))
+    (candidates, skips)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,10 +247,13 @@ struct ParsedLabel {
 /// of the label (`<config>: #<number>` then an optional `[pre]` / `[post of
 /// #<n>]` / `[post]` marker immediately after), before any free-text
 /// date/description, so a hostile description can never change what gets
-/// parsed here. Returns `None` for anything that doesn't match, and also for
+/// parsed here. Splits on the LAST `": #"` occurrence (not the first) so a
+/// config name that itself contains `": #"` can't redirect parsing to that
+/// earlier, hostile occurrence instead of the real number that follows the
+/// config name. Returns `None` for anything that doesn't match, and also for
 /// number `0` (defense in depth — `0` must never reach an argv).
 fn parse_manual_label(label: &str) -> Option<ParsedLabel> {
-    let (config, rest) = label.split_once(": #")?;
+    let (config, rest) = label.rsplit_once(": #")?;
     let digits_end = rest
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(rest.len());
@@ -474,6 +510,17 @@ mod tests {
         out
     }
 
+    // --- is_valid_config_name ---
+
+    #[test]
+    fn test_is_valid_config_name_rejects_leading_dash_and_unsafe_chars() {
+        assert!(is_valid_config_name("root"));
+        assert!(is_valid_config_name("my-config_1.bak"));
+        assert!(!is_valid_config_name("-evil"));
+        assert!(!is_valid_config_name("has space"));
+        assert!(!is_valid_config_name(""));
+    }
+
     // --- gating ---
 
     #[test]
@@ -545,7 +592,7 @@ mod tests {
             limine_absent(),
         ]));
 
-        let candidates = cleanup_detector(&f.ctx, &f.ctx.config.clone());
+        let (candidates, _skips) = cleanup_detector(&f.ctx, &f.ctx.config.clone());
         assert_eq!(candidates.len(), 2);
         assert_eq!(
             candidates[0].label,
@@ -567,7 +614,7 @@ mod tests {
             HashMap::from([(list_snapshots_argv("root"), cmd_output(&snapshot_json(&[])))]),
             limine_active(),
         ]));
-        let candidates = cleanup_detector(&f.ctx, &f.ctx.config.clone());
+        let (candidates, _skips) = cleanup_detector(&f.ctx, &f.ctx.config.clone());
         assert!(
             candidates[0]
                 .label
@@ -583,7 +630,7 @@ mod tests {
             HashMap::from([(list_snapshots_argv("root"), cmd_output(&snapshot_json(&[])))]),
             limine_inactive(),
         ]));
-        let candidates = cleanup_detector(&f.ctx, &f.ctx.config.clone());
+        let (candidates, _skips) = cleanup_detector(&f.ctx, &f.ctx.config.clone());
         assert!(
             candidates[0]
                 .label
@@ -599,11 +646,27 @@ mod tests {
             HashMap::from([(list_snapshots_argv("root"), cmd_output(&snapshot_json(&[])))]),
             limine_absent(),
         ]));
-        let candidates = cleanup_detector(&f.ctx, &f.ctx.config.clone());
+        let (candidates, _skips) = cleanup_detector(&f.ctx, &f.ctx.config.clone());
         assert_eq!(
             candidates[0].label,
             "run snapper cleanup 'number' for config root (0 snapshots)"
         );
+    }
+
+    #[test]
+    fn test_cleanup_detector_skips_config_with_invalid_name_not_a_candidate() {
+        let mut f = fixture();
+        f.ctx.fake_command_output = Some(merge(vec![
+            HashMap::from([(list_configs_argv(), list_configs_output(&["root", "-evil"]))]),
+            HashMap::from([(list_snapshots_argv("root"), cmd_output(&snapshot_json(&[])))]),
+            limine_absent(),
+        ]));
+
+        let (candidates, skips) = cleanup_detector(&f.ctx, &f.ctx.config.clone());
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].label.contains("config root"));
+        assert_eq!(skips.len(), 1);
+        assert!(skips[0].0.contains("-evil"));
     }
 
     // --- cleanup builder ---
@@ -778,6 +841,45 @@ mod tests {
         let (candidates, _) = manual_detector(&f.ctx, &f.ctx.config.clone());
         let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
         assert_eq!(labels, vec!["root: #10 [pre]", "root: #11 [post of #10]"]);
+    }
+
+    #[test]
+    fn test_manual_detector_skips_config_with_invalid_name_not_a_candidate() {
+        let mut f = fixture();
+        write_cmdline(&f, "subvol=@snapshots/999/snapshot\n");
+        f.ctx.fake_command_output = Some(merge(vec![
+            HashMap::from([(list_configs_argv(), list_configs_output(&["-evil", "root"]))]),
+            HashMap::from([(
+                list_snapshots_argv("root"),
+                cmd_output(r#"{"root": [{"number":4}]}"#),
+            )]),
+            limine_absent(),
+        ]));
+
+        let (candidates, skips) = manual_detector(&f.ctx, &f.ctx.config.clone());
+        let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels, vec!["root: #4"]);
+        assert!(skips.iter().any(|s| s.0.contains("-evil")));
+    }
+
+    // --- parse_manual_label ---
+
+    // Regression: a config name containing ": #" (e.g. a config literally
+    // named "root: #999") must not redirect parsing to that earlier, hostile
+    // occurrence. Splitting on the FIRST ": #" would read this label as
+    // config "root", number 999, kind Single — an entirely different
+    // snapshot than the real one (#4, [pre]) that follows the config name.
+    #[test]
+    fn test_parse_manual_label_hostile_config_name_does_not_redirect_number() {
+        let parsed = parse_manual_label("root: #999: #4 [pre]").unwrap();
+        assert_eq!(
+            parsed,
+            ParsedLabel {
+                config: "root: #999".to_string(),
+                number: 4,
+                kind: ParsedKind::Pre,
+            }
+        );
     }
 
     // --- manual builder ---
