@@ -431,6 +431,7 @@ mod tests {
                 "pacman".to_string(),
                 "-Rns".to_string(),
                 "--noconfirm".to_string(),
+                "--".to_string(),
                 "foo".to_string(),
             ]
         );
@@ -453,6 +454,7 @@ mod tests {
                 "uninstall".to_string(),
                 "--delete-data".to_string(),
                 "--noninteractive".to_string(),
+                "--".to_string(),
                 "org.foo.App".to_string(),
             ],
             CmdOutput {
@@ -494,6 +496,7 @@ mod tests {
                 "uninstall".to_string(),
                 "--delete-data".to_string(),
                 "--noninteractive".to_string(),
+                "--".to_string(),
                 "org.foo.App".to_string(),
             ],
             CmdOutput {
@@ -603,6 +606,7 @@ mod tests {
                 "uninstall".to_string(),
                 "--delete-data".to_string(),
                 "--noninteractive".to_string(),
+                "--".to_string(),
                 "org.foo.App".to_string(),
             ],
             CmdOutput {
@@ -656,6 +660,7 @@ mod tests {
                 "uninstall".to_string(),
                 "--delete-data".to_string(),
                 "--noninteractive".to_string(),
+                "--".to_string(),
                 "org.foo.App".to_string(),
             ],
             CmdOutput {

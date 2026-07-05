@@ -124,12 +124,16 @@ pub(crate) fn parse_pacman_installed_sizes(text: &str) -> HashMap<String, u64> {
 }
 
 /// Extracts the bare package name from a candidate's label, stripping any
-/// " (size unknown)" suffix the detector appended for display.
+/// " (size unknown)" suffix the detector appended for display. The `--`
+/// separates pacman's own options from the selected names (identifiers out
+/// of pacman's own database), so a name that happens to start with `-` is
+/// never misinterpreted as a flag.
 fn pacman_orphans_cmd(_ctx: &Ctx, _config: &Config, selected: &[Candidate]) -> Vec<CmdSpec> {
     let mut argv = vec![
         "pacman".to_string(),
         "-Rns".to_string(),
         "--noconfirm".to_string(),
+        "--".to_string(),
     ];
     argv.extend(selected.iter().map(|c| {
         c.label
@@ -452,8 +456,39 @@ mod tests {
                     "pacman".to_string(),
                     "-Rns".to_string(),
                     "--noconfirm".to_string(),
+                    "--".to_string(),
                     "bar-lib".to_string(),
                     "mystery-pkg".to_string(),
+                ],
+                sudo: true,
+                label: "Remove selected orphan packages".to_string(),
+            }]
+        );
+    }
+
+    // Regression: a package name is an identifier from pacman's own
+    // database, but nothing stopped it from being interpreted as a pacman
+    // flag if it happened to start with a dash. `--` (end-of-options) must
+    // separate pacman's own flags from the selected names, no matter what
+    // they look like.
+    #[test]
+    fn test_pacman_orphans_cmd_inserts_end_of_options_separator_before_dash_prefixed_name() {
+        let selected = vec![crate::core::item::Candidate::new(
+            None,
+            "-suspicious-pkg".to_string(),
+            0,
+            Risk::Moderate,
+        )];
+        let specs = pacman_orphans_cmd(&Fixture::dummy_ctx(), &Config::default(), &selected);
+        assert_eq!(
+            specs,
+            vec![CmdSpec {
+                argv: vec![
+                    "pacman".to_string(),
+                    "-Rns".to_string(),
+                    "--noconfirm".to_string(),
+                    "--".to_string(),
+                    "-suspicious-pkg".to_string(),
                 ],
                 sudo: true,
                 label: "Remove selected orphan packages".to_string(),

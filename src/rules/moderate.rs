@@ -195,6 +195,10 @@ fn extract_id(rest: &str) -> Option<String> {
     (end > start + 1).then(|| rest[start + 1..end].to_string())
 }
 
+/// Builds the `rmi`/`rm` argv for the selected images/containers. `--`
+/// separates the engine's own options from the IDs (identifiers out of the
+/// engine's own listing), so an ID that happens to start with `-` is never
+/// misinterpreted as a flag.
 fn containers_prune_cmd(ctx: &Ctx, _config: &Config, selected: &[Candidate]) -> Vec<CmdSpec> {
     let tool = container_tool(ctx);
     let mut image_ids = Vec::new();
@@ -209,7 +213,7 @@ fn containers_prune_cmd(ctx: &Ctx, _config: &Config, selected: &[Candidate]) -> 
 
     let mut specs = Vec::new();
     if !image_ids.is_empty() {
-        let mut argv = vec![tool.to_string(), "rmi".to_string()];
+        let mut argv = vec![tool.to_string(), "rmi".to_string(), "--".to_string()];
         argv.extend(image_ids);
         specs.push(CmdSpec {
             argv,
@@ -218,7 +222,7 @@ fn containers_prune_cmd(ctx: &Ctx, _config: &Config, selected: &[Candidate]) -> 
         });
     }
     if !container_ids.is_empty() {
-        let mut argv = vec![tool.to_string(), "rm".to_string()];
+        let mut argv = vec![tool.to_string(), "rm".to_string(), "--".to_string()];
         argv.extend(container_ids);
         specs.push(CmdSpec {
             argv,
@@ -437,13 +441,19 @@ mod tests {
                     argv: vec![
                         "podman".to_string(),
                         "rmi".to_string(),
+                        "--".to_string(),
                         "abc123".to_string()
                     ],
                     sudo: false,
                     label: "Remove selected dangling images".to_string(),
                 },
                 CmdSpec {
-                    argv: vec!["podman".to_string(), "rm".to_string(), "def456".to_string()],
+                    argv: vec![
+                        "podman".to_string(),
+                        "rm".to_string(),
+                        "--".to_string(),
+                        "def456".to_string()
+                    ],
                     sudo: false,
                     label: "Remove selected stopped containers".to_string(),
                 },
@@ -465,6 +475,58 @@ mod tests {
         let specs = containers_prune_cmd(&ctx, &Config::default(), &selected);
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].label, "Remove selected dangling images");
+    }
+
+    // Regression: an image/container ID is an identifier from the container
+    // engine's own listing, but nothing stopped it from being interpreted as
+    // a podman/docker flag if it happened to start with a dash. `--`
+    // (end-of-options) must separate the engine's own flags from the
+    // selected IDs, no matter what they look like.
+    #[test]
+    fn test_containers_prune_cmd_inserts_end_of_options_separator_before_dash_prefixed_id() {
+        let selected = vec![
+            Candidate::new(
+                None,
+                "image <none> (-abc123)".to_string(),
+                0,
+                Risk::Moderate,
+            ),
+            Candidate::new(
+                None,
+                "container old-build (-def456)".to_string(),
+                0,
+                Risk::Moderate,
+            ),
+        ];
+        let mut ctx = Fixture::dummy_ctx();
+        ctx.available_commands = Some(vec!["podman".to_string()]);
+
+        let specs = containers_prune_cmd(&ctx, &Config::default(), &selected);
+        assert_eq!(
+            specs,
+            vec![
+                CmdSpec {
+                    argv: vec![
+                        "podman".to_string(),
+                        "rmi".to_string(),
+                        "--".to_string(),
+                        "-abc123".to_string()
+                    ],
+                    sudo: false,
+                    label: "Remove selected dangling images".to_string(),
+                },
+                CmdSpec {
+                    argv: vec![
+                        "podman".to_string(),
+                        "rm".to_string(),
+                        "--".to_string(),
+                        "-def456".to_string()
+                    ],
+                    sudo: false,
+                    label: "Remove selected stopped containers".to_string(),
+                },
+            ]
+        );
     }
 
     // --- system.coredumps ---

@@ -44,14 +44,18 @@ fn parse_line(line: &str) -> Option<InstalledPackage> {
     })
 }
 
-/// `flatpak uninstall --delete-data --noninteractive <id>` — never sudo:
-/// this only ever touches the invoking user's own flatpak installation.
+/// `flatpak uninstall --delete-data --noninteractive -- <id>` — never sudo:
+/// this only ever touches the invoking user's own flatpak installation. The
+/// `--` separates flatpak's own options from `id` (an app ID out of
+/// flatpak's own database), so an ID that happens to start with `-` is never
+/// misinterpreted as a flag.
 pub fn remove_argv(id: &str) -> Vec<String> {
     vec![
         "flatpak".to_string(),
         "uninstall".to_string(),
         "--delete-data".to_string(),
         "--noninteractive".to_string(),
+        "--".to_string(),
         id.to_string(),
     ]
 }
@@ -130,7 +134,27 @@ mod tests {
                 "uninstall".to_string(),
                 "--delete-data".to_string(),
                 "--noninteractive".to_string(),
+                "--".to_string(),
                 "org.foo.App".to_string(),
+            ]
+        );
+    }
+
+    // Regression: an app ID is an identifier from flatpak's own database, but
+    // nothing stopped it from being interpreted as a flatpak flag if it
+    // happened to start with a dash. `--` (end-of-options) must separate
+    // flatpak's own flags from the ID, no matter what the ID looks like.
+    #[test]
+    fn test_remove_argv_inserts_end_of_options_separator_before_a_dash_prefixed_id() {
+        assert_eq!(
+            remove_argv("-suspicious"),
+            vec![
+                "flatpak".to_string(),
+                "uninstall".to_string(),
+                "--delete-data".to_string(),
+                "--noninteractive".to_string(),
+                "--".to_string(),
+                "-suspicious".to_string(),
             ]
         );
     }

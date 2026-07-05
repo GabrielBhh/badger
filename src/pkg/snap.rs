@@ -40,9 +40,16 @@ fn parse_snap_list(text: &str) -> Vec<InstalledPackage> {
         .collect()
 }
 
-/// `snap remove <name>` — always run via sudo.
+/// `snap remove -- <name>` — always run via sudo. The `--` separates snap's
+/// own options from `name` (an identifier out of snapd's own database), so a
+/// name that happens to start with `-` is never misinterpreted as a flag.
 pub fn remove_argv(name: &str) -> Vec<String> {
-    vec!["snap".to_string(), "remove".to_string(), name.to_string()]
+    vec![
+        "snap".to_string(),
+        "remove".to_string(),
+        "--".to_string(),
+        name.to_string(),
+    ]
 }
 
 #[cfg(test)]
@@ -106,7 +113,25 @@ mod tests {
             vec![
                 "snap".to_string(),
                 "remove".to_string(),
+                "--".to_string(),
                 "hello".to_string()
+            ]
+        );
+    }
+
+    // Regression: a snap name is an identifier from snapd's own database, but
+    // nothing stopped it from being interpreted as a snap flag if it happened
+    // to start with a dash. `--` (end-of-options) must separate snap's own
+    // flags from the name, no matter what the name looks like.
+    #[test]
+    fn test_remove_argv_inserts_end_of_options_separator_before_a_dash_prefixed_name() {
+        assert_eq!(
+            remove_argv("-suspicious"),
+            vec![
+                "snap".to_string(),
+                "remove".to_string(),
+                "--".to_string(),
+                "-suspicious".to_string()
             ]
         );
     }

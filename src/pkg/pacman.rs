@@ -58,12 +58,16 @@ fn parse_name_version_lines(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// `pacman -Rns --noconfirm <id>` — always run via sudo.
+/// `pacman -Rns --noconfirm -- <id>` — always run via sudo. The `--`
+/// separates pacman's own options from `id` (a package name out of pacman's
+/// database), so a name that happens to start with `-` is never
+/// misinterpreted as a flag.
 pub fn remove_argv(id: &str) -> Vec<String> {
     vec![
         "pacman".to_string(),
         "-Rns".to_string(),
         "--noconfirm".to_string(),
+        "--".to_string(),
         id.to_string(),
     ]
 }
@@ -200,7 +204,26 @@ mod tests {
                 "pacman".to_string(),
                 "-Rns".to_string(),
                 "--noconfirm".to_string(),
+                "--".to_string(),
                 "foo".to_string(),
+            ]
+        );
+    }
+
+    // Regression: a package name is an identifier from pacman's own database,
+    // but nothing stopped it from being interpreted as a pacman flag if it
+    // happened to start with a dash. `--` (end-of-options) must separate
+    // pacman's own flags from the name, no matter what the name looks like.
+    #[test]
+    fn test_remove_argv_inserts_end_of_options_separator_before_a_dash_prefixed_name() {
+        assert_eq!(
+            remove_argv("-suspicious"),
+            vec![
+                "pacman".to_string(),
+                "-Rns".to_string(),
+                "--noconfirm".to_string(),
+                "--".to_string(),
+                "-suspicious".to_string(),
             ]
         );
     }
