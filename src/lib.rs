@@ -10,6 +10,7 @@ pub mod privilege;
 pub mod purge;
 pub mod rules;
 pub mod safety;
+pub mod sys;
 pub mod tui;
 pub mod uninstall_leftovers;
 pub mod util;
