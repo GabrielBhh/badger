@@ -16,18 +16,25 @@ use crate::pkg::Backend;
 use crate::safety::protected::{SafetyEnv, Tier, validate_deletable};
 use crate::util::dirsize::dir_size;
 
+/// The locations this scan ever looks under — also the `validate_deletable`
+/// allowed-prefixes list, and reused as-is by `commands::uninstall` when it
+/// later deletes exactly what was selected from this scan's candidates.
+pub fn allowed_prefixes(ctx: &Ctx) -> Vec<PathBuf> {
+    vec![
+        ctx.home.join(".config"),
+        ctx.home.join(".local/share"),
+        ctx.home.join(".cache"),
+        ctx.home.join(".var/app"),
+    ]
+}
+
 /// Scans for leftovers of a just-removed package. `name` is the package's
 /// display name (used for the per-app directories and glob prefixes); `id`
 /// is its backend identifier (used only for flatpak's `~/.var/app/<id>`,
 /// since that directory is keyed by app ID, not name).
 pub fn scan(ctx: &Ctx, name: &str, id: &str, backend: Backend) -> anyhow::Result<Group> {
     let env = SafetyEnv::from_system(ctx)?;
-    let allowed: Vec<PathBuf> = vec![
-        ctx.home.join(".config"),
-        ctx.home.join(".local/share"),
-        ctx.home.join(".cache"),
-        ctx.home.join(".var/app"),
-    ];
+    let allowed = allowed_prefixes(ctx);
 
     let name_variants = name_variants(name);
     let mut found: Vec<PathBuf> = Vec::new();

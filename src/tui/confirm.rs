@@ -147,6 +147,37 @@ pub fn handle_key(state: &mut ConfirmState, key: KeyEvent) -> Outcome {
     }
 }
 
+/// Plain yes/no confirmation with no typed-count requirement — used by
+/// screens (like `badger uninstall`'s removal confirm) that have nothing
+/// like the checklist's Moderate/Risky selection to summarize, just a fixed
+/// set of informational lines shown verbatim.
+pub struct PlainConfirmState {
+    lines: Vec<String>,
+}
+
+impl PlainConfirmState {
+    pub fn new(lines: Vec<String>) -> PlainConfirmState {
+        PlainConfirmState { lines }
+    }
+}
+
+/// Applies one key to a plain confirmation screen. Reuses `Outcome` from the
+/// checklist-driven confirm above; there's no typed-input state to mutate.
+pub fn handle_plain_key(key: KeyEvent) -> Outcome {
+    match key.code {
+        KeyCode::Char('y') => Outcome::Proceed,
+        KeyCode::Char('n') | KeyCode::Esc => Outcome::Back,
+        _ => Outcome::None,
+    }
+}
+
+pub fn render_plain(frame: &mut Frame, state: &PlainConfirmState) {
+    let mut lines: Vec<Line> = state.lines.iter().map(|l| Line::from(l.clone())).collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from("y proceed  n/esc back"));
+    frame.render_widget(Paragraph::new(lines), frame.area());
+}
+
 pub fn render(frame: &mut Frame, state: &ConfirmState) {
     let mut lines = vec![
         Line::from("badger clean — confirm"),
@@ -396,5 +427,42 @@ mod tests {
         assert!(text.contains("includes 1 Risky item(s)"));
         assert!(text.contains("enter confirm  n/esc back"));
         assert!(!text.contains("y proceed"));
+    }
+
+    // --- PlainConfirmState / handle_plain_key / render_plain ---
+
+    #[test]
+    fn test_handle_plain_key_y_proceeds() {
+        assert_eq!(handle_plain_key(key(KeyCode::Char('y'))), Outcome::Proceed);
+    }
+
+    #[test]
+    fn test_handle_plain_key_n_and_esc_go_back() {
+        assert_eq!(handle_plain_key(key(KeyCode::Char('n'))), Outcome::Back);
+        assert_eq!(handle_plain_key(key(KeyCode::Esc)), Outcome::Back);
+    }
+
+    #[test]
+    fn test_handle_plain_key_ignores_other_keys() {
+        assert_eq!(handle_plain_key(key(KeyCode::Char('x'))), Outcome::None);
+    }
+
+    fn draw_plain(state: &PlainConfirmState) -> Buffer {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_plain(f, state)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn test_render_plain_shows_every_line_and_the_prompt() {
+        let state = PlainConfirmState::new(vec![
+            "About to remove firefox (121.0-1) via pacman.".to_string(),
+            "Command: sudo pacman -Rns --noconfirm firefox".to_string(),
+        ]);
+        let text = full_text(&draw_plain(&state));
+        assert!(text.contains("About to remove firefox (121.0-1) via pacman."));
+        assert!(text.contains("Command: sudo pacman -Rns --noconfirm firefox"));
+        assert!(text.contains("y proceed  n/esc back"));
     }
 }
