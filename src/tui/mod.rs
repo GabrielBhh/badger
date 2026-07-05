@@ -10,6 +10,7 @@ use ratatui::backend::CrosstermBackend;
 
 pub mod checklist;
 pub mod confirm;
+pub mod dashboard;
 pub mod explorer;
 pub mod picker;
 

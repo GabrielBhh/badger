@@ -25,13 +25,13 @@ pub struct StatusOutput {
 /// rate. Process CPU tracking (`sys::procs`) isn't included here: sustained
 /// hogs need many samples over a window, which a one-shot command can't
 /// provide — that's for the live dashboard.
-struct Samples {
+pub(crate) struct Samples {
     cpu: cpu::CpuSample,
     disk: disk::DiskSample,
     net: net::NetSample,
 }
 
-fn take_samples(ctx: &Ctx) -> Samples {
+pub(crate) fn take_samples(ctx: &Ctx) -> Samples {
     Samples {
         cpu: cpu::read_cpu_sample(ctx).unwrap_or_default(),
         disk: disk::read_diskstats(ctx).unwrap_or_default(),
@@ -62,7 +62,7 @@ pub struct StatusReport {
 /// Builds the full status report from a pair of samples `interval_secs`
 /// apart. Split out from `run` so tests can drive it with fabricated
 /// samples instead of a real 500ms sleep.
-fn build_report(
+pub(crate) fn build_report(
     ctx: &Ctx,
     before: &Samples,
     after: &Samples,
