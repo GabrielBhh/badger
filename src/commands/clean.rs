@@ -1,9 +1,7 @@
 use std::collections::HashSet;
 use std::io::IsTerminal;
 
-use serde::Serialize;
-
-use crate::commands::shared::{drive_selection, execution_notes};
+use crate::commands::shared::{JsonOutput, drive_selection, execution_notes};
 use crate::core::exec::{DryRunEffector, RealEffector, Summary, execute, execute_selected};
 use crate::core::item::{Group, Risk};
 use crate::core::runner::RealRunner;
@@ -17,13 +15,6 @@ use crate::tui;
 
 pub struct CleanOutput {
     pub rendered: String,
-}
-
-#[derive(Serialize)]
-struct JsonOutput<'a> {
-    groups: &'a [Group],
-    summary: Option<&'a Summary>,
-    dry_run: bool,
 }
 
 pub fn run(ctx: &Ctx, yes: bool, dry_run_flag: bool, mode: Mode) -> anyhow::Result<CleanOutput> {
