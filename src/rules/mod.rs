@@ -8,6 +8,7 @@ pub mod command;
 pub mod dev;
 pub mod moderate;
 pub mod optimize;
+pub mod snapshots;
 pub mod user;
 
 /// Whether a rule even makes sense to run in the current environment.
@@ -142,6 +143,7 @@ pub fn registry() -> Vec<Rule> {
     rules.extend(dev::rules());
     rules.extend(command::rules());
     rules.extend(moderate::rules());
+    rules.extend(snapshots::rules());
     rules
 }
 
