@@ -12,7 +12,8 @@ use serde::Serialize;
 
 use crate::ctx::Ctx;
 use crate::output::{self, Mode};
-use crate::sys::{cachyos, cpu, disk, health, hwmon, mem, net, power, psi};
+use crate::sys::{cachyos, cpu, disk, health, hwmon, mem, net, power, procs, psi};
+use crate::tui::{self, dashboard};
 
 /// How long to wait between the two samples used to compute rates.
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
@@ -156,6 +157,87 @@ pub fn run(ctx: &Ctx, mode: Mode) -> anyhow::Result<StatusOutput> {
         Mode::Human => render_human(&report),
     };
     Ok(StatusOutput { rendered })
+}
+
+/// How long each dashboard tick waits before sampling again — the live
+/// counterpart of `SAMPLE_INTERVAL`, just repeated instead of one-shot.
+const TICK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Interactive `badger status`: a live dashboard refreshed once a second,
+/// reusing the same `take_samples`/`build_report` pair the one-shot report
+/// uses (each tick's samples become the next tick's "before"). Per-process
+/// CPU tracking runs alongside on the same 1-second cadence, so
+/// `proc_cpu_window_secs` doubles as a tick count.
+pub fn run_dashboard(
+    ctx: &Ctx,
+    proc_cpu_threshold: f64,
+    proc_cpu_window_secs: u64,
+) -> anyhow::Result<StatusOutput> {
+    let mut session = dashboard::DashboardSession::new(proc_cpu_threshold, proc_cpu_window_secs);
+    let mut terminal = tui::init_terminal()?;
+    let result = drive_dashboard(&mut terminal, &mut session, ctx);
+    tui::restore_terminal(&mut terminal)?;
+    result?;
+    // Nothing gets journaled or deleted here, unlike analyze's explorer —
+    // there's no summary to print once the terminal is back to normal.
+    Ok(StatusOutput {
+        rendered: String::new(),
+    })
+}
+
+/// Polls for key events in slices of up to 100ms until either `budget`
+/// elapses (returns `true`, time for the next tick) or a quit key arrives
+/// (returns `false`) — same short-poll pattern as `analyze`'s
+/// `drive_explorer`, just budgeted per tick instead of run to completion.
+fn wait_for_next_tick(budget: Duration) -> anyhow::Result<bool> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(true);
+        }
+        if !crossterm::event::poll(remaining.min(Duration::from_millis(100)))? {
+            continue;
+        }
+        let crossterm::event::Event::Key(key) = crossterm::event::read()? else {
+            continue;
+        };
+        if key.kind == crossterm::event::KeyEventKind::Release {
+            continue;
+        }
+        if dashboard::is_quit_key(key) {
+            return Ok(false);
+        }
+    }
+}
+
+/// Drives the dashboard's tick loop against a real terminal: draws
+/// immediately, then alternates waiting-for-a-tick-or-quit with sampling and
+/// redrawing. All state transitions live on `DashboardSession`/
+/// `DashboardState` (unit-tested separately); this loop is only the
+/// sampling/terminal glue.
+fn drive_dashboard(
+    terminal: &mut tui::Term,
+    session: &mut dashboard::DashboardSession,
+    ctx: &Ctx,
+) -> anyhow::Result<()> {
+    let colors = tui::colors_enabled_now();
+    terminal.draw(|f| dashboard::render(f, session.state(), colors))?;
+
+    let mut prev = take_samples(ctx);
+    loop {
+        if !wait_for_next_tick(TICK_INTERVAL)? {
+            return Ok(());
+        }
+
+        let curr = take_samples(ctx);
+        let report = build_report(ctx, &prev, &curr, TICK_INTERVAL.as_secs_f64())?;
+        let proc_sample = procs::sample_all(ctx);
+        session.on_tick(&report, proc_sample, TICK_INTERVAL.as_secs_f64());
+        prev = curr;
+
+        terminal.draw(|f| dashboard::render(f, session.state(), colors))?;
+    }
 }
 
 fn render_human(r: &StatusReport) -> String {

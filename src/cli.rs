@@ -36,8 +36,17 @@ pub enum Command {
     Uninstall,
     /// Optimize mirrors and system settings
     Optimize,
-    /// Show current system status
-    Status,
+    /// Show current system status (a live dashboard on a TTY)
+    Status {
+        /// CPU% a process must sustain to be flagged as a hog in the live
+        /// dashboard's alerts panel
+        #[arg(long, default_value_t = 80.0)]
+        proc_cpu_threshold: f64,
+        /// How many seconds a process must stay above the threshold to be
+        /// flagged
+        #[arg(long, default_value_t = 30)]
+        proc_cpu_window: u64,
+    },
     /// Aggressively purge reclaimable space
     Purge {
         /// Actually delete pre-checked (non-recent) selections (default just plans)

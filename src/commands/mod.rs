@@ -1,3 +1,5 @@
+use std::io::IsTerminal;
+
 use anyhow::bail;
 use clap::CommandFactory;
 
@@ -88,15 +90,27 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Optimize => {
             bail!("`badger optimize` is not implemented yet — coming in a later phase")
         }
-        Command::Status => {
+        Command::Status {
+            proc_cpu_threshold,
+            proc_cpu_window,
+        } => {
             let ctx = crate::ctx::Ctx::resolve(
                 cli.dry_run,
                 cli.debug,
                 crate::ctx::EnvOverrides::from_process(),
             )?;
             let mode = crate::output::current(cli.json);
-            let output = status::run(&ctx, mode)?;
-            println!("{}", output.rendered);
+            // Same gating as clean/purge/uninstall/analyze: only a real,
+            // interactive terminal gets the live dashboard.
+            if mode == crate::output::Mode::Human && std::io::stderr().is_terminal() {
+                let output = status::run_dashboard(&ctx, proc_cpu_threshold, proc_cpu_window)?;
+                if !output.rendered.is_empty() {
+                    println!("{}", output.rendered);
+                }
+            } else {
+                let output = status::run(&ctx, mode)?;
+                println!("{}", output.rendered);
+            }
             Ok(())
         }
         Command::Purge { yes } => {

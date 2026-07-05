@@ -20,6 +20,7 @@ use crate::sys::cpu::LoadAvg;
 use crate::sys::hwmon::HwmonChip;
 use crate::sys::mem::MemInfo;
 use crate::sys::power::Battery;
+use crate::sys::procs::{ProcCpuTracker, ProcSample};
 use crate::sys::psi::SystemPsi;
 
 /// How many ticks of history each series keeps (~2 minutes at the
@@ -141,6 +142,50 @@ impl DashboardState {
 impl Default for DashboardState {
     fn default() -> DashboardState {
         DashboardState::new()
+    }
+}
+
+/// Ties `DashboardState` to a `ProcCpuTracker` behind one message-seam
+/// `on_tick`, mirroring `explorer::ExplorerSession`: the caller does all the
+/// I/O (sampling `/proc`, the real 1-second loop lives in
+/// `commands::status`) and just hands each tick's already-sampled data in.
+pub struct DashboardSession {
+    state: DashboardState,
+    tracker: ProcCpuTracker,
+    threshold_pct: f64,
+    window_samples: usize,
+}
+
+impl DashboardSession {
+    /// `window_secs` doubles as the tracker's sample-history window since
+    /// the caller ticks once a second.
+    pub fn new(threshold_pct: f64, window_secs: u64) -> DashboardSession {
+        let window_samples = window_secs.max(1) as usize;
+        DashboardSession {
+            state: DashboardState::new(),
+            tracker: ProcCpuTracker::new(window_samples),
+            threshold_pct,
+            window_samples,
+        }
+    }
+
+    pub fn state(&self) -> &DashboardState {
+        &self.state
+    }
+
+    /// One tick: folds `proc_sample` into the CPU-hog tracker, then folds
+    /// `report` plus whatever hogs that produced into the render state.
+    pub fn on_tick(
+        &mut self,
+        report: &StatusReport,
+        proc_sample: Vec<ProcSample>,
+        interval_secs: f64,
+    ) {
+        self.tracker.add_sample(proc_sample, interval_secs);
+        let hogs = self
+            .tracker
+            .sustained_hogs(self.threshold_pct, self.window_samples);
+        self.state.on_tick(report, hogs);
     }
 }
 
@@ -621,6 +666,42 @@ mod tests {
         }
         assert_eq!(state.cpu_total_history.len(), HISTORY_LEN);
         assert_eq!(state.ticks(), (HISTORY_LEN + 10) as u64);
+    }
+
+    // --- DashboardSession ---
+
+    fn proc_sample(pid: u32, name: &str, utime: u64, stime: u64) -> crate::sys::procs::ProcSample {
+        crate::sys::procs::ProcSample {
+            pid,
+            name: name.to_string(),
+            utime,
+            stime,
+        }
+    }
+
+    #[test]
+    fn test_session_reports_no_hogs_before_the_window_is_full() {
+        let mut session = DashboardSession::new(50.0, 3);
+        session.on_tick(&report(), vec![proc_sample(1, "hog", 0, 0)], 1.0);
+        session.on_tick(&report(), vec![proc_sample(1, "hog", 90, 0)], 1.0);
+        assert!(session.state().hogs.is_empty());
+    }
+
+    #[test]
+    fn test_session_reports_a_hog_once_sustained_for_the_whole_window() {
+        let mut session = DashboardSession::new(50.0, 3);
+        session.on_tick(&report(), vec![proc_sample(1, "hog", 0, 0)], 1.0);
+        session.on_tick(&report(), vec![proc_sample(1, "hog", 90, 0)], 1.0);
+        session.on_tick(&report(), vec![proc_sample(1, "hog", 180, 0)], 1.0);
+        session.on_tick(&report(), vec![proc_sample(1, "hog", 270, 0)], 1.0);
+        assert_eq!(session.state().hogs, vec![(1, "hog".to_string(), 90.0)]);
+    }
+
+    #[test]
+    fn test_session_folds_report_into_its_state_alongside_hogs() {
+        let mut session = DashboardSession::new(50.0, 1);
+        session.on_tick(&report(), Vec::new(), 1.0);
+        assert_eq!(session.state().health_score, 95);
     }
 
     // --- render ---
