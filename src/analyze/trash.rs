@@ -1,6 +1,6 @@
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow, bail};
@@ -51,11 +51,15 @@ fn candidate_names(file_name: &str) -> impl Iterator<Item = String> {
 
 /// Claims the first available `<info_dir>/<candidate>.trashinfo` name for
 /// `file_name` (itself, then `.2`, `.3`, ...), creating the file exclusively.
-/// `candidate_names` never terminates, so the loop below only ever exits via
-/// `return` or `?` — using a bare `loop` (rather than `for`) means the loop
-/// expression itself has type `!`, so there's no fallthrough to handle.
+/// Also skips any candidate whose `<files_dir>/<candidate>` already exists
+/// (e.g. an orphan left by a crash, or a manually-deleted trashinfo) — the
+/// eventual rename would otherwise silently overwrite it. `candidate_names`
+/// never terminates, so the loop below only ever exits via `return` or `?` —
+/// using a bare `loop` (rather than `for`) means the loop expression itself
+/// has type `!`, so there's no fallthrough to handle.
 fn claim_info_file(
     info_dir: &Path,
+    files_dir: &Path,
     file_name: &str,
 ) -> anyhow::Result<(std::fs::File, PathBuf, String)> {
     let mut candidates = candidate_names(file_name);
@@ -64,17 +68,22 @@ fn claim_info_file(
             continue;
         };
         let info_path = info_dir.join(format!("{candidate}.trashinfo"));
-        match std::fs::OpenOptions::new()
+        let file = match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&info_path)
         {
-            Ok(f) => return Ok((f, info_path, candidate)),
+            Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
                 return Err(e).with_context(|| format!("failed to create {}", info_path.display()));
             }
+        };
+        if files_dir.join(&candidate).exists() {
+            let _ = std::fs::remove_file(&info_path);
+            continue;
         }
+        return Ok((file, info_path, candidate));
     }
 }
 
@@ -128,6 +137,10 @@ pub fn trash_path(
         .with_context(|| format!("failed to create {}", files_dir.display()))?;
     std::fs::create_dir_all(&info_dir)
         .with_context(|| format!("failed to create {}", info_dir.display()))?;
+    // Freedesktop trash spec recommends the trash directory be created with
+    // 700 permissions, regardless of the process umask.
+    std::fs::set_permissions(&trash_dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to set permissions on {}", trash_dir.display()))?;
 
     let source_dev = std::fs::symlink_metadata(path)
         .with_context(|| format!("failed to stat {}", path.display()))?
@@ -164,7 +177,8 @@ pub fn trash_path(
         percent_encode(&absolute_path)
     );
 
-    let (mut info_file, info_path, final_name) = claim_info_file(&info_dir, &file_name)?;
+    let (mut info_file, info_path, final_name) =
+        claim_info_file(&info_dir, &files_dir, &file_name)?;
 
     if let Err(e) = info_file
         .write_all(info_contents.as_bytes())
@@ -274,6 +288,50 @@ mod tests {
         let (decoded_path, deletion_date) = parse_trashinfo(&info_path);
         assert_eq!(decoded_path, target.display().to_string());
         deletion_date.parse::<jiff::civil::DateTime>().unwrap();
+    }
+
+    #[test]
+    fn test_trash_dir_is_created_with_0700_permissions() {
+        let f = fixture();
+        let stuff = f.ctx.home.join("stuff");
+        std::fs::create_dir_all(&stuff).unwrap();
+        let target = stuff.join("junk.txt");
+        std::fs::write(&target, b"hello").unwrap();
+
+        trash_path(&f.ctx, &f.ctx.home, &target, "run-1").unwrap();
+
+        let trash_dir = f.ctx.home.join(".local/share/Trash");
+        let mode = std::fs::metadata(&trash_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn test_orphaned_files_entry_is_not_clobbered_by_rename() {
+        let f = fixture();
+        let stuff = f.ctx.home.join("stuff");
+        std::fs::create_dir_all(&stuff).unwrap();
+        let target = stuff.join("junk.txt");
+        std::fs::write(&target, b"new content").unwrap();
+
+        // An orphaned files/ entry with no matching .trashinfo (e.g. left
+        // behind by a crash, or a manually-deleted trashinfo file).
+        let files_dir = f.ctx.home.join(".local/share/Trash/files");
+        std::fs::create_dir_all(&files_dir).unwrap();
+        let orphan = files_dir.join("junk.txt");
+        std::fs::write(&orphan, b"orphaned content").unwrap();
+
+        let outcome = trash_path(&f.ctx, &f.ctx.home, &target, "run-1").unwrap();
+
+        assert_eq!(
+            std::fs::read(&orphan).unwrap(),
+            b"orphaned content",
+            "the orphaned file must not be overwritten"
+        );
+        assert_eq!(outcome.trashed_to, files_dir.join("junk.txt.2"));
+
+        let info = f.ctx.home.join(".local/share/Trash/info");
+        assert!(!info.join("junk.txt.trashinfo").exists());
+        assert!(info.join("junk.txt.2.trashinfo").exists());
     }
 
     #[test]
