@@ -35,7 +35,11 @@ pub enum Command {
     /// Uninstall unused packages
     Uninstall,
     /// Optimize mirrors and system settings
-    Optimize,
+    Optimize {
+        /// Actually run pre-checked tasks (default just plans)
+        #[arg(long)]
+        yes: bool,
+    },
     /// Show current system status (a live dashboard on a TTY)
     Status {
         /// CPU% a process must sustain to be flagged as a hog in the live
