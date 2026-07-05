@@ -6,6 +6,7 @@ use crate::ctx::Ctx;
 
 pub mod command;
 pub mod dev;
+pub mod moderate;
 pub mod user;
 
 /// Whether a rule even makes sense to run in the current environment.
@@ -113,6 +114,7 @@ pub fn registry() -> Vec<Rule> {
     rules.extend(user::rules());
     rules.extend(dev::rules());
     rules.extend(command::rules());
+    rules.extend(moderate::rules());
     rules
 }
 
