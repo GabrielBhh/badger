@@ -42,6 +42,35 @@ fn candidate_names(file_name: &str) -> impl Iterator<Item = String> {
     std::iter::once(file_name.clone()).chain((2..).map(move |n| format!("{file_name}.{n}")))
 }
 
+/// Claims the first available `<info_dir>/<candidate>.trashinfo` name for
+/// `file_name` (itself, then `.2`, `.3`, ...), creating the file exclusively.
+/// `candidate_names` never terminates, so the loop below only ever exits via
+/// `return` or `?` — using a bare `loop` (rather than `for`) means the loop
+/// expression itself has type `!`, so there's no fallthrough to handle.
+fn claim_info_file(
+    info_dir: &Path,
+    file_name: &str,
+) -> anyhow::Result<(std::fs::File, PathBuf, String)> {
+    let mut candidates = candidate_names(file_name);
+    loop {
+        let Some(candidate) = candidates.next() else {
+            continue;
+        };
+        let info_path = info_dir.join(format!("{candidate}.trashinfo"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&info_path)
+        {
+            Ok(f) => return Ok((f, info_path, candidate)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("failed to create {}", info_path.display()));
+            }
+        }
+    }
+}
+
 /// Writes a record to the journal; a failed audit-trail write must not fail
 /// the caller's action, so it's reported to stderr instead (matches
 /// `core::exec`'s "audit trail must not abort" convention).
@@ -129,28 +158,7 @@ pub fn trash_path(
         percent_encode(&absolute_path)
     );
 
-    let mut final_name = None;
-    let mut info_file = None;
-    for candidate in candidate_names(&file_name) {
-        let info_path = info_dir.join(format!("{candidate}.trashinfo"));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&info_path)
-        {
-            Ok(f) => {
-                final_name = Some(candidate);
-                info_file = Some((f, info_path));
-                break;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => {
-                return Err(e).with_context(|| format!("failed to create {}", info_path.display()));
-            }
-        }
-    }
-    let final_name = final_name.expect("candidate_names never terminates");
-    let (mut info_file, info_path) = info_file.expect("set alongside final_name");
+    let (mut info_file, info_path, final_name) = claim_info_file(&info_dir, &file_name)?;
 
     if let Err(e) = info_file
         .write_all(info_contents.as_bytes())
