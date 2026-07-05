@@ -1,7 +1,11 @@
+use std::collections::HashMap;
+
 use crate::config::Config;
 use crate::core::item::{Candidate, Risk};
+use crate::core::runner::runner_for;
 use crate::ctx::Ctx;
 use crate::rules::{Action, Applicability, CmdSpec, Detector, Rule, expand_path_spec};
+use crate::util::parse_human_size;
 
 pub fn rules() -> Vec<Rule> {
     vec![
@@ -49,7 +53,94 @@ pub fn rules() -> Vec<Rule> {
             action: Action::Cmd(journald_cmd),
             notes: "Vacuums the journal down to the configured size cap.",
         },
+        Rule {
+            id: "pacman.orphans",
+            title: "Orphaned packages",
+            risk: Risk::Moderate,
+            requires_sudo: true,
+            applicable: Applicability::CommandExists("pacman"),
+            allowed_prefixes: &[],
+            detector: Detector::Fn(pacman_orphans_detector),
+            action: Action::CmdSelected(pacman_orphans_cmd),
+            notes: "No longer required by any explicitly installed package. Some may be \
+                    optional dependencies you still want — review before removing.",
+        },
     ]
+}
+
+/// One `pacman -Qtdq` (orphans) followed by one `pacman -Qi <names>` (sizes,
+/// best-effort) — both via the detection-only `CommandRunner` seam so tests
+/// never shell out for real. A package `pacman -Qi` has no parseable
+/// "Installed Size" for is still offered, just with bytes 0 and a label
+/// noting the size is unknown.
+fn pacman_orphans_detector(ctx: &Ctx, _config: &Config) -> Vec<Candidate> {
+    let runner = runner_for(ctx);
+    let names: Vec<String> = match runner.run(&["pacman".to_string(), "-Qtdq".to_string()]) {
+        Ok(out) => out.stdout.lines().map(str::to_string).collect(),
+        Err(_) => Vec::new(),
+    };
+    if names.is_empty() {
+        return Vec::new();
+    }
+
+    let mut qi_argv = vec!["pacman".to_string(), "-Qi".to_string()];
+    qi_argv.extend(names.iter().cloned());
+    let sizes = match runner.run(&qi_argv) {
+        Ok(out) => parse_pacman_installed_sizes(&out.stdout),
+        Err(_) => HashMap::new(),
+    };
+
+    names
+        .into_iter()
+        .map(|name| match sizes.get(&name) {
+            Some(&bytes) => Candidate::new(None, name, bytes, Risk::Moderate),
+            None => Candidate::new(None, format!("{name} (size unknown)"), 0, Risk::Moderate),
+        })
+        .collect()
+}
+
+/// Parses `pacman -Qi`'s "Name" / "Installed Size" fields into a
+/// name -> bytes map. Tolerant of formatting quirks: an entry whose size
+/// can't be parsed is simply omitted (the caller falls back to "unknown").
+fn parse_pacman_installed_sizes(text: &str) -> HashMap<String, u64> {
+    let mut out = HashMap::new();
+    let mut current_name: Option<String> = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("Name") {
+            current_name = rest.split_once(':').map(|(_, v)| v.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("Installed Size") {
+            let Some(name) = &current_name else { continue };
+            let Some((_, value)) = rest.split_once(':') else {
+                continue;
+            };
+            if let Some(bytes) = parse_human_size(value.trim()) {
+                out.insert(name.clone(), bytes);
+            }
+        }
+    }
+    out
+}
+
+/// Extracts the bare package name from a candidate's label, stripping any
+/// " (size unknown)" suffix the detector appended for display.
+fn pacman_orphans_cmd(_ctx: &Ctx, _config: &Config, selected: &[Candidate]) -> Vec<CmdSpec> {
+    let mut argv = vec![
+        "pacman".to_string(),
+        "-Rns".to_string(),
+        "--noconfirm".to_string(),
+    ];
+    argv.extend(selected.iter().map(|c| {
+        c.label
+            .split_whitespace()
+            .next()
+            .unwrap_or(&c.label)
+            .to_string()
+    }));
+    vec![CmdSpec {
+        argv,
+        sudo: true,
+        label: "Remove selected orphan packages".to_string(),
+    }]
 }
 
 fn pacman_cache_size(ctx: &Ctx, _config: &Config) -> Vec<Candidate> {
@@ -246,5 +337,125 @@ mod tests {
         let groups = scan(&rules(), &f.ctx, &f.ctx.config.clone(), &empty_whitelist()).unwrap();
         let group = groups.iter().find(|g| g.rule_id == "aur.paru").unwrap();
         assert_eq!(group.candidates.len(), 1);
+    }
+
+    // --- pacman.orphans ---
+
+    fn cmd_output(stdout: &str) -> crate::core::runner::CmdOutput {
+        crate::core::runner::CmdOutput {
+            success: true,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_pacman_orphans_group_requires_pacman_command() {
+        let f = fixture();
+        let groups = scan(&rules(), &f.ctx, &f.ctx.config.clone(), &empty_whitelist()).unwrap();
+        assert!(!groups.iter().any(|g| g.rule_id == "pacman.orphans"));
+    }
+
+    #[test]
+    fn test_pacman_orphans_detector_returns_empty_when_no_orphans() {
+        let mut f = fixture();
+        f.ctx.available_commands = Some(vec!["pacman".to_string()]);
+        f.ctx.fake_command_output = Some(HashMap::from([(
+            vec!["pacman".to_string(), "-Qtdq".to_string()],
+            cmd_output(""),
+        )]));
+
+        let candidates = pacman_orphans_detector(&f.ctx, &f.ctx.config.clone());
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_pacman_orphans_detector_parses_installed_size_per_package() {
+        let mut f = fixture();
+        f.ctx.available_commands = Some(vec!["pacman".to_string()]);
+        let qi_output = "Name            : foo-lib\n\
+                          Installed Size  : 1024.00 KiB\n\
+                          \n\
+                          Name            : bar-lib\n\
+                          Installed Size  : 2.00 MiB\n";
+        f.ctx.fake_command_output = Some(HashMap::from([
+            (
+                vec!["pacman".to_string(), "-Qtdq".to_string()],
+                cmd_output("foo-lib\nbar-lib\n"),
+            ),
+            (
+                vec![
+                    "pacman".to_string(),
+                    "-Qi".to_string(),
+                    "foo-lib".to_string(),
+                    "bar-lib".to_string(),
+                ],
+                cmd_output(qi_output),
+            ),
+        ]));
+
+        let candidates = pacman_orphans_detector(&f.ctx, &f.ctx.config.clone());
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].label, "foo-lib");
+        assert_eq!(candidates[0].bytes, 1024 * 1024);
+        assert_eq!(candidates[1].label, "bar-lib");
+        assert_eq!(candidates[1].bytes, 2 * 1024 * 1024);
+        assert!(
+            candidates.iter().all(|c| !c.selectable),
+            "Moderate starts unchecked"
+        );
+    }
+
+    #[test]
+    fn test_pacman_orphans_detector_notes_size_unknown_when_qi_has_no_entry() {
+        let mut f = fixture();
+        f.ctx.available_commands = Some(vec!["pacman".to_string()]);
+        f.ctx.fake_command_output = Some(HashMap::from([
+            (
+                vec!["pacman".to_string(), "-Qtdq".to_string()],
+                cmd_output("mystery-pkg\n"),
+            ),
+            (
+                vec![
+                    "pacman".to_string(),
+                    "-Qi".to_string(),
+                    "mystery-pkg".to_string(),
+                ],
+                cmd_output(""),
+            ),
+        ]));
+
+        let candidates = pacman_orphans_detector(&f.ctx, &f.ctx.config.clone());
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].label, "mystery-pkg (size unknown)");
+        assert_eq!(candidates[0].bytes, 0);
+    }
+
+    #[test]
+    fn test_pacman_orphans_cmd_builds_remove_argv_from_selected_candidates_only() {
+        let selected = vec![
+            crate::core::item::Candidate::new(None, "bar-lib".to_string(), 0, Risk::Moderate),
+            crate::core::item::Candidate::new(
+                None,
+                "mystery-pkg (size unknown)".to_string(),
+                0,
+                Risk::Moderate,
+            ),
+        ];
+        let specs = pacman_orphans_cmd(&Fixture::dummy_ctx(), &Config::default(), &selected);
+        assert_eq!(
+            specs,
+            vec![CmdSpec {
+                argv: vec![
+                    "pacman".to_string(),
+                    "-Rns".to_string(),
+                    "--noconfirm".to_string(),
+                    "bar-lib".to_string(),
+                    "mystery-pkg".to_string(),
+                ],
+                sudo: true,
+                label: "Remove selected orphan packages".to_string(),
+            }]
+        );
     }
 }
