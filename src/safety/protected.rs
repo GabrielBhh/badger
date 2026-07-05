@@ -2,6 +2,8 @@ use std::collections::HashSet;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
     System,
@@ -66,16 +68,23 @@ impl SafetyEnv {
         list
     }
 
-    pub fn from_system(ctx: &crate::ctx::Ctx) -> SafetyEnv {
-        let mount_points = std::fs::read_to_string("/proc/self/mountinfo")
-            .map(|text| parse_mountinfo(&text))
-            .unwrap_or_default();
+    /// Infallible core: builds a `SafetyEnv` from already-read mountinfo text.
+    fn from_mountinfo_text(root: &Path, home: &Path, text: &str) -> SafetyEnv {
         SafetyEnv {
-            root: ctx.root.clone(),
-            home: ctx.home.clone(),
-            mount_points,
+            root: root.to_path_buf(),
+            home: home.to_path_buf(),
+            mount_points: parse_mountinfo(text),
             euid: nix::unistd::geteuid().as_raw(),
         }
+    }
+
+    // Thin wrapper: reads /proc/self/mountinfo and delegates. Not unit-tested
+    // (can't force /proc to be unreadable in a test); the failure path is
+    // reviewed by inspection instead.
+    pub fn from_system(ctx: &crate::ctx::Ctx) -> anyhow::Result<SafetyEnv> {
+        let text = std::fs::read_to_string("/proc/self/mountinfo")
+            .context("failed to read /proc/self/mountinfo")?;
+        Ok(SafetyEnv::from_mountinfo_text(&ctx.root, &ctx.home, &text))
     }
 }
 
@@ -220,5 +229,16 @@ mod tests {
         assert!(mounts.contains(Path::new("/")));
         assert!(mounts.contains(Path::new("/proc")));
         assert!(mounts.contains(Path::new("/home/user/My Files")));
+    }
+
+    #[test]
+    fn test_from_mountinfo_text_builds_safety_env_from_root_and_home() {
+        let text = "36 35 98:0 / / rw,noatime master:1 - ext4 /dev/root rw,errors=remount-ro\n";
+        let root = PathBuf::from("/");
+        let home = PathBuf::from("/home/user");
+        let env = SafetyEnv::from_mountinfo_text(&root, &home, text);
+        assert_eq!(env.root, root);
+        assert_eq!(env.home, home);
+        assert!(env.mount_points.contains(Path::new("/")));
     }
 }
