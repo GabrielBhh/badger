@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 use std::io::IsTerminal;
 
-use crossterm::event::{Event, KeyEventKind};
 use serde::Serialize;
 
+use crate::commands::shared::{drive_selection, execution_notes};
 use crate::core::exec::{DryRunEffector, RealEffector, Summary, execute, execute_selected};
 use crate::core::item::{Group, Risk};
 use crate::core::runner::RealRunner;
@@ -13,7 +13,7 @@ use crate::output::{Mode, humanize_bytes};
 use crate::rules::{self, Action, Rule};
 use crate::safety::journal::Journal;
 use crate::safety::whitelist::Whitelist;
-use crate::tui::{self, checklist, confirm};
+use crate::tui;
 
 pub struct CleanOutput {
     pub rendered: String,
@@ -97,25 +97,6 @@ pub fn run(ctx: &Ctx, yes: bool, dry_run_flag: bool, mode: Mode) -> anyhow::Resu
     Ok(CleanOutput { rendered })
 }
 
-/// Reads back the journal for `run_id` and formats "note: <rule> —
-/// <outcome>" lines for skipped/error/refused outcomes recorded during
-/// execution. Shared by the `--yes` non-interactive path and the interactive
-/// TUI path (`render_after_selection`) so execution-time refusals (TOCTOU,
-/// privileged-helper errors, ...) are never silently invisible.
-fn execution_notes(journal: &Journal, run_id: &str) -> anyhow::Result<Vec<String>> {
-    let (records, _) = journal.read_all()?;
-    Ok(records
-        .iter()
-        .filter(|r| r.run_id == run_id)
-        .filter(|r| {
-            r.outcome.starts_with("skipped")
-                || r.outcome.starts_with("error")
-                || r.outcome.starts_with("refused")
-        })
-        .map(|r| format!("note: {} — {}", r.rule, r.outcome))
-        .collect())
-}
-
 /// Interactive `badger clean`: scan, show the checklist and risk-scaled
 /// confirmation, then execute exactly what was selected.
 fn run_interactive(ctx: &Ctx, dry_run_flag: bool) -> anyhow::Result<CleanOutput> {
@@ -148,58 +129,6 @@ fn run_interactive(ctx: &Ctx, dry_run_flag: bool) -> anyhow::Result<CleanOutput>
 
     let journal = Journal::new(&ctx.state_dir);
     render_after_selection(&groups, &selection, &rules, ctx, &journal, dry_run_flag)
-}
-
-/// Drives the checklist -> confirm key-handling loop against a real
-/// terminal. Returns the confirmed selection, or `None` if the person
-/// cancelled from the checklist.
-fn drive_selection(
-    terminal: &mut tui::Term,
-    groups: Vec<Group>,
-) -> anyhow::Result<Option<HashSet<(usize, usize)>>> {
-    let mut state = checklist::ChecklistState::new(groups);
-    let mut confirming: Option<confirm::ConfirmState> = None;
-    let colors = tui::colors_enabled_now();
-
-    loop {
-        let height = terminal.size()?.height;
-        if let Some(confirm_state) = &confirming {
-            terminal.draw(|f| confirm::render(f, confirm_state))?;
-        } else {
-            state.scroll_into_view(checklist::body_height(height));
-            terminal.draw(|f| checklist::render(f, &state, colors))?;
-        }
-
-        let Event::Key(key) = crossterm::event::read()? else {
-            continue;
-        };
-        if key.kind == KeyEventKind::Release {
-            continue;
-        }
-
-        if let Some(confirm_state) = &mut confirming {
-            match confirm::handle_key(confirm_state, key) {
-                confirm::Outcome::Proceed => return Ok(Some(state.selection().clone())),
-                confirm::Outcome::Back => confirming = None,
-                confirm::Outcome::None => {}
-            }
-            continue;
-        }
-
-        match checklist::map_key(key) {
-            Some(checklist::Action::Down) => state.move_down(),
-            Some(checklist::Action::Up) => state.move_up(),
-            Some(checklist::Action::Toggle) => state.toggle(),
-            Some(checklist::Action::ToggleGroup) => state.toggle_group(),
-            Some(checklist::Action::Top) => state.top(),
-            Some(checklist::Action::Bottom) => state.bottom(),
-            Some(checklist::Action::Cancel) => return Ok(None),
-            Some(checklist::Action::Confirm) => {
-                confirming = Some(confirm::ConfirmState::from_checklist(&state));
-            }
-            None => {}
-        }
-    }
 }
 
 /// The terminal-free seam: given a scan's groups and an already-made
