@@ -1,14 +1,16 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
 use crate::analyze::disk::DiskTotals;
 use crate::analyze::sizer::{DirNode, LargeFile};
 use crate::output::humanize_bytes;
+use crate::tui::confirm;
 
 const BAR_WIDTH: usize = 20;
 
@@ -52,6 +54,40 @@ impl ScanProgress {
     }
 }
 
+/// Why a trash attempt didn't move anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrashError {
+    /// Source sits on a different filesystem from the trash directory; the
+    /// only way to delete it from the explorer is permanently.
+    CrossFilesystem,
+    Failed(String),
+}
+
+/// Carries out the explorer's delete actions. The real implementation
+/// (in `commands::analyze`) wraps the engine's `trash_path` and the safety
+/// deleter; tests inject a scripted fake — the same seam split as
+/// `core::exec::Effector`.
+pub trait AnalyzeEffector {
+    /// Moves `path` to the freedesktop trash, returning the bytes freed.
+    fn trash(&mut self, path: &Path) -> Result<u64, TrashError>;
+    /// Permanently deletes `path` (no trash), returning the bytes freed.
+    fn delete_permanent(&mut self, path: &Path) -> Result<u64, String>;
+}
+
+/// A delete confirmation in progress.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Prompt {
+    /// Plain yes/no before moving to trash.
+    Trash { path: PathBuf, bytes: u64 },
+    /// Typed-word ("delete") confirmation before a permanent delete —
+    /// offered only after trash refused with `CrossFilesystem`.
+    Permanent {
+        path: PathBuf,
+        bytes: u64,
+        input: String,
+    },
+}
+
 /// The full lifecycle of one interactive analyze session as a message-driven
 /// state machine: starts scanning, absorbs `(dirs, bytes)` progress ticks,
 /// and swaps to a browsable `ExplorerState` when the scan's final tree
@@ -64,6 +100,7 @@ pub struct ExplorerSession {
     explorer: Option<ExplorerState>,
     totals: DiskTotals,
     now: i64,
+    prompt: Option<Prompt>,
 }
 
 impl ExplorerSession {
@@ -73,6 +110,7 @@ impl ExplorerSession {
             explorer: None,
             totals,
             now,
+            prompt: None,
         }
     }
 
@@ -120,14 +158,193 @@ impl ExplorerSession {
     pub fn explorer(&self) -> Option<&ExplorerState> {
         self.explorer.as_ref()
     }
+
+    pub fn prompt(&self) -> Option<&Prompt> {
+        self.prompt.as_ref()
+    }
+
+    /// The delete key: opens the trash confirmation for the row under the
+    /// cursor. The "(loose files)" aggregate isn't a real filesystem entry,
+    /// so it only gets a status hint; the scan root never appears as a row.
+    pub fn request_delete(&mut self) {
+        if self.prompt.is_some() {
+            return;
+        }
+        let Some(state) = self.explorer.as_mut() else {
+            return;
+        };
+        match state.selection() {
+            Selection::Dir { path, bytes } | Selection::LargeFile { path, bytes } => {
+                self.prompt = Some(Prompt::Trash { path, bytes });
+            }
+            Selection::LooseFiles => {
+                state.set_status(
+                    "(loose files) is an aggregate — it can't be deleted as a unit".to_string(),
+                );
+            }
+            Selection::None => {}
+        }
+    }
+
+    pub fn cancel_prompt(&mut self) {
+        self.prompt = None;
+    }
+
+    /// "Yes" on the trash prompt: attempts the move. Success removes the
+    /// row and shrinks every ancestor's total; a cross-filesystem refusal
+    /// escalates to the typed permanent-delete prompt; any other failure
+    /// lands in the status line.
+    pub fn confirm_trash(&mut self, effector: &mut dyn AnalyzeEffector) {
+        let Some(Prompt::Trash { path, bytes }) = self.prompt.clone() else {
+            return;
+        };
+        match effector.trash(&path) {
+            Ok(freed) => {
+                self.prompt = None;
+                if let Some(state) = self.explorer.as_mut() {
+                    state.remove_path(&path, bytes);
+                    state.set_status(format!(
+                        "trashed {} ({}) — recoverable from the trash",
+                        path.display(),
+                        humanize_bytes(freed)
+                    ));
+                }
+            }
+            Err(TrashError::CrossFilesystem) => {
+                self.prompt = Some(Prompt::Permanent {
+                    path,
+                    bytes,
+                    input: String::new(),
+                });
+            }
+            Err(TrashError::Failed(msg)) => {
+                self.prompt = None;
+                if let Some(state) = self.explorer.as_mut() {
+                    state.set_status(format!("error: {msg}"));
+                }
+            }
+        }
+    }
+
+    pub fn prompt_input_push(&mut self, c: char) {
+        if let Some(Prompt::Permanent { input, .. }) = self.prompt.as_mut() {
+            input.push(c);
+        }
+    }
+
+    pub fn prompt_input_backspace(&mut self) {
+        if let Some(Prompt::Permanent { input, .. }) = self.prompt.as_mut() {
+            input.pop();
+        }
+    }
+
+    /// Enter on the permanent-delete prompt: only acts once the exact word
+    /// "delete" has been typed.
+    pub fn confirm_permanent(&mut self, effector: &mut dyn AnalyzeEffector) {
+        let Some(Prompt::Permanent { path, bytes, input }) = self.prompt.clone() else {
+            return;
+        };
+        if input != "delete" {
+            return;
+        }
+        self.prompt = None;
+        match effector.delete_permanent(&path) {
+            Ok(freed) => {
+                if let Some(state) = self.explorer.as_mut() {
+                    state.remove_path(&path, bytes);
+                    state.set_status(format!(
+                        "permanently deleted {} ({})",
+                        path.display(),
+                        humanize_bytes(freed)
+                    ));
+                }
+            }
+            Err(msg) => {
+                if let Some(state) = self.explorer.as_mut() {
+                    state.set_status(format!("error: {msg}"));
+                }
+            }
+        }
+    }
 }
 
-/// Renders whichever screen the session is on: the scanning counters, or
-/// the explorer once the tree has landed.
+/// Routes one key while a delete prompt is on screen. Returns `false` when
+/// no prompt is active (the caller should handle the key normally).
+pub fn handle_prompt_key(
+    session: &mut ExplorerSession,
+    key: KeyEvent,
+    effector: &mut dyn AnalyzeEffector,
+) -> bool {
+    match session.prompt() {
+        None => false,
+        Some(Prompt::Trash { .. }) => {
+            match confirm::handle_plain_key(key) {
+                confirm::Outcome::Proceed => session.confirm_trash(effector),
+                confirm::Outcome::Back => session.cancel_prompt(),
+                confirm::Outcome::None => {}
+            }
+            true
+        }
+        Some(Prompt::Permanent { .. }) => {
+            match key.code {
+                KeyCode::Esc => session.cancel_prompt(),
+                KeyCode::Enter => session.confirm_permanent(effector),
+                KeyCode::Backspace => session.prompt_input_backspace(),
+                KeyCode::Char(c) => session.prompt_input_push(c),
+                _ => {}
+            }
+            true
+        }
+    }
+}
+
+/// Renders whichever screen the session is on: an active delete prompt,
+/// the scanning counters, or the explorer once the tree has landed.
 pub fn render_session(frame: &mut Frame, session: &ExplorerSession, colors: bool) {
+    if let Some(prompt) = session.prompt() {
+        render_prompt(frame, prompt, colors);
+        return;
+    }
     match session.explorer() {
         Some(state) => render(frame, state, colors),
         None => render_scanning(frame, session.progress()),
+    }
+}
+
+fn render_prompt(frame: &mut Frame, prompt: &Prompt, colors: bool) {
+    match prompt {
+        Prompt::Trash { path, bytes } => {
+            let state = confirm::PlainConfirmState::new(vec![
+                "badger analyze — confirm trash".to_string(),
+                String::new(),
+                path.display().to_string(),
+                format!("size: {}", humanize_bytes(*bytes)),
+                "moves to trash — recoverable".to_string(),
+            ]);
+            confirm::render_plain(frame, &state);
+        }
+        Prompt::Permanent { path, bytes, input } => {
+            let title_style = if colors {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let lines = vec![
+                Line::styled("badger analyze — PERMANENT DELETE", title_style),
+                Line::from(""),
+                Line::from(path.display().to_string()),
+                Line::from(format!("size: {}", humanize_bytes(*bytes))),
+                Line::from(
+                    "can't trash across filesystems — this delete is permanent, NOT recoverable",
+                ),
+                Line::from(""),
+                Line::from("Type \"delete\" to confirm:"),
+                Line::from(format!("> {input}")),
+                Line::from(""),
+                Line::from("enter confirm  esc back"),
+            ];
+            frame.render_widget(Paragraph::new(lines), frame.area());
+        }
     }
 }
 
@@ -225,6 +442,9 @@ pub struct ExplorerState {
     /// Reference time (unix seconds) ages are computed against. Passed in
     /// rather than read live so rendering/age math stays pure and testable.
     now: i64,
+    /// Latest action outcome ("trashed X", "error: ..."), shown in the
+    /// footer until the next one replaces it.
+    status: Option<String>,
 }
 
 fn build_rows(node: &DirNode, sort_mode: SortMode) -> Vec<Row> {
@@ -308,11 +528,20 @@ impl ExplorerState {
             sort_mode,
             large_files: false,
             now,
+            status: None,
         }
     }
 
     pub fn is_complete(&self) -> bool {
         self.complete
+    }
+
+    pub fn set_status(&mut self, status: String) {
+        self.status = Some(status);
+    }
+
+    pub fn status(&self) -> Option<&str> {
+        self.status.as_deref()
     }
 
     pub fn is_large_files_view(&self) -> bool {
@@ -463,6 +692,37 @@ impl ExplorerState {
             self.scroll = max_scroll;
         }
     }
+
+    /// Removes a just-deleted `path` (a directory row or a large file) from
+    /// the tree's accounting: every ancestor's recursive total shrinks by
+    /// `bytes`, the directory's own node (if it was one) disappears, and
+    /// any large-files entries at or under `path` are dropped. The scan
+    /// root itself is never removed. Deletes only ever target rows of the
+    /// directory being browsed (or large-file entries), so the browsing
+    /// position itself can't dangle.
+    pub fn remove_path(&mut self, path: &Path, bytes: u64) {
+        fn walk(node: &mut DirNode, path: &Path, bytes: u64) {
+            node.bytes = node.bytes.saturating_sub(bytes);
+            if let Some(i) = node.children.iter().position(|c| c.path.as_path() == path) {
+                node.children.remove(i);
+                return;
+            }
+            if let Some(child) = node.children.iter_mut().find(|c| path.starts_with(&c.path)) {
+                walk(child, path, bytes);
+            }
+        }
+
+        if self.root.path.as_path() == path || !path.starts_with(&self.root.path) {
+            return;
+        }
+        walk(&mut self.root, path, bytes);
+        self.top_files.retain(|f| !f.path.starts_with(path));
+        self.rebuild_rows();
+        let count = self.row_count();
+        if self.cursor >= count {
+            self.cursor = count.saturating_sub(1);
+        }
+    }
 }
 
 /// Abstract keys the explorer screen reacts to, decoupled from crossterm's
@@ -606,14 +866,19 @@ fn render_large_files_body(frame: &mut Frame, area: Rect, state: &ExplorerState)
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, state: &ExplorerState) {
-    let mut lines = vec![
-        Line::from(format!("sort: {}  {}", state.sort_mode.label(), {
-            if !state.complete { "(partial)" } else { "" }
-        })),
-        Line::from("j/k move  enter/l open  h/backspace up  s sort  L large files"),
-        Line::from("g/G top/bottom  q/esc quit"),
-    ];
-    lines.retain(|l| !l.spans.is_empty());
+    let mut lines = Vec::with_capacity(4);
+    if let Some(status) = state.status() {
+        lines.push(Line::from(status.to_string()));
+    }
+    lines.push(Line::from(format!(
+        "sort: {}{}",
+        state.sort_mode.label(),
+        if !state.complete { "  (partial)" } else { "" }
+    )));
+    lines.push(Line::from(
+        "j/k move  enter/l open  h/backspace up  s sort  L large files",
+    ));
+    lines.push(Line::from("g/G top/bottom  d delete  q/esc quit"));
     frame.render_widget(Paragraph::new(lines), area);
 }
 
@@ -625,10 +890,15 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
 
-    fn node(name: &str, bytes: u64, mtime: i64, children: Vec<DirNode>) -> DirNode {
+    fn node(path: &str, bytes: u64, mtime: i64, children: Vec<DirNode>) -> DirNode {
+        let path = PathBuf::from(path);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         DirNode {
-            path: PathBuf::from(name),
-            name: name.to_string(),
+            path,
+            name,
             bytes,
             files: 0,
             mtime,
@@ -653,23 +923,20 @@ mod tests {
     ///     nested (2000 bytes, mtime 5000)
     /// plus 2000 bytes of loose files directly in root (mtime = root's own).
     fn sample_root() -> DirNode {
-        let mut root = node(
+        node(
             "/scan/root",
             12000,
             9000,
             vec![
-                node("big", 8000, 1000, Vec::new()),
+                node("/scan/root/big", 8000, 1000, Vec::new()),
                 node(
-                    "small",
+                    "/scan/root/small",
                     2000,
                     5000,
-                    vec![node("nested", 2000, 5000, Vec::new())],
+                    vec![node("/scan/root/small/nested", 2000, 5000, Vec::new())],
                 ),
             ],
-        );
-        root.path = PathBuf::from("/scan/root");
-        root.name = "root".to_string();
-        root
+        )
     }
 
     fn state() -> ExplorerState {
@@ -835,8 +1102,7 @@ mod tests {
 
     #[test]
     fn test_toggle_large_files_switches_view_and_resets_cursor() {
-        let mut root = sample_root();
-        root.path = PathBuf::from("/scan/root");
+        let root = sample_root();
         let top_files = vec![
             LargeFile {
                 path: PathBuf::from("/scan/root/big/f1"),
@@ -1139,5 +1405,417 @@ mod tests {
         let text = full_text(&draw_session(&session));
         assert!(!text.contains("scanning"));
         assert!(text.contains("> big"));
+    }
+
+    // --- remove_path ---
+
+    #[test]
+    fn test_remove_path_removes_dir_and_decrements_every_ancestor() {
+        let mut s = state();
+        s.remove_path(Path::new("/scan/root/small/nested"), 2000);
+        assert_eq!(s.root.bytes, 10000);
+        let small = s.root.children.iter().find(|c| c.name == "small").unwrap();
+        assert_eq!(small.bytes, 0);
+        assert!(small.children.is_empty());
+    }
+
+    #[test]
+    fn test_remove_path_of_a_file_decrements_ancestors_without_removing_dirs() {
+        let mut s = state();
+        // A large file inside big: dirs stay, sizes shrink.
+        s.remove_path(Path::new("/scan/root/big/blob.bin"), 3000);
+        assert_eq!(s.root.bytes, 9000);
+        let big = s.root.children.iter().find(|c| c.name == "big").unwrap();
+        assert_eq!(big.bytes, 5000);
+        assert_eq!(s.root.children.len(), 2);
+    }
+
+    #[test]
+    fn test_remove_path_drops_top_files_under_the_deleted_dir() {
+        let top_files = vec![
+            LargeFile {
+                path: PathBuf::from("/scan/root/big/f1"),
+                bytes: 5000,
+                mtime: 1000,
+            },
+            LargeFile {
+                path: PathBuf::from("/scan/root/small/f2"),
+                bytes: 1000,
+                mtime: 2000,
+            },
+        ];
+        let mut s = ExplorerState::new(sample_root(), totals(), top_files, true, 10_000);
+        s.remove_path(Path::new("/scan/root/big"), 8000);
+        assert_eq!(s.top_files.len(), 1);
+        assert_eq!(s.top_files[0].path, PathBuf::from("/scan/root/small/f2"));
+    }
+
+    #[test]
+    fn test_remove_path_never_removes_the_scan_root() {
+        let mut s = state();
+        s.remove_path(Path::new("/scan/root"), 12000);
+        assert_eq!(s.root.bytes, 12000);
+        assert_eq!(s.root.children.len(), 2);
+    }
+
+    #[test]
+    fn test_remove_path_clamps_cursor_when_last_row_disappears() {
+        let mut s = state();
+        s.bottom();
+        assert_eq!(s.cursor(), 2);
+        s.remove_path(Path::new("/scan/root/big"), 8000);
+        assert!(s.cursor() < s.row_count());
+    }
+
+    // --- delete state machine ---
+
+    struct FakeEffector {
+        trash_result: Result<u64, TrashError>,
+        delete_result: Result<u64, String>,
+        trash_calls: Vec<PathBuf>,
+        delete_calls: Vec<PathBuf>,
+    }
+
+    impl FakeEffector {
+        fn new() -> FakeEffector {
+            FakeEffector {
+                trash_result: Ok(0),
+                delete_result: Ok(0),
+                trash_calls: Vec::new(),
+                delete_calls: Vec::new(),
+            }
+        }
+
+        fn trash_ok(bytes: u64) -> FakeEffector {
+            FakeEffector {
+                trash_result: Ok(bytes),
+                ..FakeEffector::new()
+            }
+        }
+
+        fn cross_filesystem() -> FakeEffector {
+            FakeEffector {
+                trash_result: Err(TrashError::CrossFilesystem),
+                ..FakeEffector::new()
+            }
+        }
+
+        fn trash_fails(msg: &str) -> FakeEffector {
+            FakeEffector {
+                trash_result: Err(TrashError::Failed(msg.to_string())),
+                ..FakeEffector::new()
+            }
+        }
+
+        fn permanent(delete_result: Result<u64, String>) -> FakeEffector {
+            FakeEffector {
+                trash_result: Err(TrashError::CrossFilesystem),
+                delete_result,
+                ..FakeEffector::new()
+            }
+        }
+    }
+
+    impl AnalyzeEffector for FakeEffector {
+        fn trash(&mut self, path: &Path) -> Result<u64, TrashError> {
+            self.trash_calls.push(path.to_path_buf());
+            self.trash_result.clone()
+        }
+
+        fn delete_permanent(&mut self, path: &Path) -> Result<u64, String> {
+            self.delete_calls.push(path.to_path_buf());
+            self.delete_result.clone()
+        }
+    }
+
+    /// A session already browsing `sample_root` with the cursor on "big".
+    fn browsing_session() -> ExplorerSession {
+        let mut session = ExplorerSession::new(totals(), 10_000);
+        session.on_finished(sample_root(), Vec::new(), true);
+        session
+    }
+
+    #[test]
+    fn test_request_delete_on_dir_opens_trash_prompt() {
+        let mut session = browsing_session();
+        session.request_delete();
+        assert_eq!(
+            session.prompt(),
+            Some(&Prompt::Trash {
+                path: PathBuf::from("/scan/root/big"),
+                bytes: 8000
+            })
+        );
+    }
+
+    #[test]
+    fn test_request_delete_on_loose_files_sets_status_instead_of_prompt() {
+        let mut session = browsing_session();
+        while session.explorer().unwrap().selection() != Selection::LooseFiles {
+            session.explorer_mut().unwrap().move_down();
+        }
+        session.request_delete();
+        assert!(session.prompt().is_none());
+        assert!(
+            session
+                .explorer()
+                .unwrap()
+                .status()
+                .unwrap()
+                .contains("aggregate")
+        );
+    }
+
+    #[test]
+    fn test_request_delete_while_scanning_is_a_noop() {
+        let mut session = ExplorerSession::new(totals(), 10_000);
+        session.request_delete();
+        assert!(session.prompt().is_none());
+    }
+
+    #[test]
+    fn test_confirm_trash_success_removes_row_and_reports_status() {
+        let mut session = browsing_session();
+        let mut effector = FakeEffector::trash_ok(7900);
+        session.request_delete();
+        session.confirm_trash(&mut effector);
+
+        assert!(session.prompt().is_none());
+        assert_eq!(effector.trash_calls, vec![PathBuf::from("/scan/root/big")]);
+        let explorer = session.explorer().unwrap();
+        assert!(!explorer.rows.iter().any(|r| r.name == "big"));
+        assert_eq!(explorer.root.bytes, 4000);
+        assert!(explorer.status().unwrap().contains("trashed"));
+        assert!(explorer.status().unwrap().contains("recoverable"));
+    }
+
+    #[test]
+    fn test_confirm_trash_cross_filesystem_escalates_to_permanent_prompt() {
+        let mut session = browsing_session();
+        let mut effector = FakeEffector::cross_filesystem();
+        session.request_delete();
+        session.confirm_trash(&mut effector);
+
+        assert_eq!(
+            session.prompt(),
+            Some(&Prompt::Permanent {
+                path: PathBuf::from("/scan/root/big"),
+                bytes: 8000,
+                input: String::new()
+            })
+        );
+        // Row must survive: nothing was deleted yet.
+        assert!(
+            session
+                .explorer()
+                .unwrap()
+                .rows
+                .iter()
+                .any(|r| r.name == "big")
+        );
+    }
+
+    #[test]
+    fn test_confirm_trash_failure_sets_status_and_keeps_row() {
+        let mut session = browsing_session();
+        let mut effector = FakeEffector::trash_fails("refused: protected path");
+        session.request_delete();
+        session.confirm_trash(&mut effector);
+
+        assert!(session.prompt().is_none());
+        let explorer = session.explorer().unwrap();
+        assert!(explorer.rows.iter().any(|r| r.name == "big"));
+        assert_eq!(explorer.root.bytes, 12000);
+        assert_eq!(explorer.status(), Some("error: refused: protected path"));
+    }
+
+    #[test]
+    fn test_permanent_delete_requires_the_exact_typed_word() {
+        let mut session = browsing_session();
+        let mut effector = FakeEffector::permanent(Ok(8000));
+        session.request_delete();
+        session.confirm_trash(&mut effector); // -> permanent prompt
+
+        for c in "del".chars() {
+            session.prompt_input_push(c);
+        }
+        session.confirm_permanent(&mut effector);
+        assert!(effector.delete_calls.is_empty(), "wrong word must not act");
+        assert!(matches!(session.prompt(), Some(Prompt::Permanent { .. })));
+
+        for c in "ete".chars() {
+            session.prompt_input_push(c);
+        }
+        session.confirm_permanent(&mut effector);
+        assert_eq!(effector.delete_calls, vec![PathBuf::from("/scan/root/big")]);
+        assert!(session.prompt().is_none());
+        let explorer = session.explorer().unwrap();
+        assert!(!explorer.rows.iter().any(|r| r.name == "big"));
+        assert!(explorer.status().unwrap().contains("permanently deleted"));
+    }
+
+    #[test]
+    fn test_permanent_delete_failure_sets_status_and_keeps_row() {
+        let mut session = browsing_session();
+        let mut effector = FakeEffector::permanent(Err("refused: not owned".to_string()));
+        session.request_delete();
+        session.confirm_trash(&mut effector);
+        for c in "delete".chars() {
+            session.prompt_input_push(c);
+        }
+        session.confirm_permanent(&mut effector);
+
+        assert!(session.prompt().is_none());
+        let explorer = session.explorer().unwrap();
+        assert!(explorer.rows.iter().any(|r| r.name == "big"));
+        assert_eq!(explorer.status(), Some("error: refused: not owned"));
+    }
+
+    #[test]
+    fn test_cancel_prompt_returns_to_browsing_untouched() {
+        let mut session = browsing_session();
+        session.request_delete();
+        session.cancel_prompt();
+        assert!(session.prompt().is_none());
+        assert_eq!(session.explorer().unwrap().root.bytes, 12000);
+    }
+
+    #[test]
+    fn test_trash_from_large_files_view_removes_file_and_shrinks_dirs() {
+        let top_files = vec![LargeFile {
+            path: PathBuf::from("/scan/root/big/f1.bin"),
+            bytes: 5000,
+            mtime: 1000,
+        }];
+        let mut session = ExplorerSession::new(totals(), 10_000);
+        session.on_finished(sample_root(), top_files, true);
+        session.explorer_mut().unwrap().toggle_large_files();
+
+        let mut effector = FakeEffector::trash_ok(5000);
+        session.request_delete();
+        session.confirm_trash(&mut effector);
+
+        assert_eq!(
+            effector.trash_calls,
+            vec![PathBuf::from("/scan/root/big/f1.bin")]
+        );
+        let explorer = session.explorer().unwrap();
+        assert!(explorer.top_files.is_empty());
+        assert_eq!(explorer.root.bytes, 7000);
+        let big = explorer
+            .root
+            .children
+            .iter()
+            .find(|c| c.name == "big")
+            .unwrap();
+        assert_eq!(big.bytes, 3000);
+    }
+
+    // --- handle_prompt_key routing ---
+
+    #[test]
+    fn test_handle_prompt_key_is_inactive_without_a_prompt() {
+        let mut session = browsing_session();
+        let mut effector = FakeEffector::new();
+        assert!(!handle_prompt_key(
+            &mut session,
+            key(KeyCode::Char('y')),
+            &mut effector
+        ));
+    }
+
+    #[test]
+    fn test_handle_prompt_key_y_confirms_trash() {
+        let mut session = browsing_session();
+        let mut effector = FakeEffector::trash_ok(8000);
+        session.request_delete();
+        assert!(handle_prompt_key(
+            &mut session,
+            key(KeyCode::Char('y')),
+            &mut effector
+        ));
+        assert_eq!(effector.trash_calls.len(), 1);
+        assert!(session.prompt().is_none());
+    }
+
+    #[test]
+    fn test_handle_prompt_key_esc_cancels_trash_prompt() {
+        let mut session = browsing_session();
+        let mut effector = FakeEffector::new();
+        session.request_delete();
+        handle_prompt_key(&mut session, key(KeyCode::Esc), &mut effector);
+        assert!(session.prompt().is_none());
+        assert!(effector.trash_calls.is_empty());
+    }
+
+    #[test]
+    fn test_handle_prompt_key_types_word_and_submits_permanent() {
+        let mut session = browsing_session();
+        let mut effector = FakeEffector::permanent(Ok(8000));
+        session.request_delete();
+        handle_prompt_key(&mut session, key(KeyCode::Char('y')), &mut effector);
+        assert!(matches!(session.prompt(), Some(Prompt::Permanent { .. })));
+
+        for c in "deletex".chars() {
+            handle_prompt_key(&mut session, key(KeyCode::Char(c)), &mut effector);
+        }
+        handle_prompt_key(&mut session, key(KeyCode::Backspace), &mut effector);
+        handle_prompt_key(&mut session, key(KeyCode::Enter), &mut effector);
+        assert_eq!(effector.delete_calls.len(), 1);
+    }
+
+    // --- prompt rendering ---
+
+    #[test]
+    fn test_render_trash_prompt_shows_path_size_and_recoverable_note() {
+        let mut session = browsing_session();
+        session.request_delete();
+        let text = full_text(&draw_session(&session));
+        assert!(text.contains("confirm trash"));
+        assert!(text.contains("/scan/root/big"));
+        assert!(text.contains("size: 7.8 KiB"));
+        assert!(text.contains("moves to trash — recoverable"));
+        assert!(text.contains("y proceed  n/esc back"));
+    }
+
+    #[test]
+    fn test_render_permanent_prompt_shows_typed_input_and_red_title() {
+        let mut session = browsing_session();
+        let mut effector = FakeEffector::cross_filesystem();
+        session.request_delete();
+        session.confirm_trash(&mut effector);
+        session.prompt_input_push('d');
+        session.prompt_input_push('e');
+
+        let buffer = draw_session(&session);
+        let text = full_text(&buffer);
+        assert!(text.contains("PERMANENT DELETE"));
+        assert!(text.contains("NOT recoverable"));
+        assert!(text.contains("Type \"delete\" to confirm:"));
+        assert!(text.contains("> de"));
+        assert!(text.contains("enter confirm  esc back"));
+
+        let y = (0..buffer.area.height)
+            .find(|&y| row_text(&buffer, y).contains("PERMANENT DELETE"))
+            .unwrap();
+        let x = row_text(&buffer, y).find("PERMANENT DELETE").unwrap() as u16;
+        assert_eq!(buffer.cell((x, y)).unwrap().fg, Color::Red);
+    }
+
+    #[test]
+    fn test_render_footer_shows_status_line_after_an_action() {
+        let mut session = browsing_session();
+        let mut effector = FakeEffector::trash_ok(8000);
+        session.request_delete();
+        session.confirm_trash(&mut effector);
+        let text = full_text(&draw_session(&session));
+        assert!(text.contains("trashed /scan/root/big"));
+    }
+
+    #[test]
+    fn test_render_footer_shows_delete_key_hint() {
+        let s = state();
+        let text = full_text(&draw(&s));
+        assert!(text.contains("d delete"));
     }
 }

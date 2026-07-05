@@ -14,8 +14,12 @@ use serde::Serialize;
 
 use crate::analyze::disk::{self, DiskTotals};
 use crate::analyze::sizer::{self, DirNode, LargeFile, ScanOptions, ScanResult};
+use crate::analyze::trash;
 use crate::ctx::Ctx;
 use crate::output::{self, Mode};
+use crate::safety::deleter::delete_tree;
+use crate::safety::journal::{Journal, Record};
+use crate::safety::protected::{SafetyEnv, Tier, validate_deletable};
 use crate::tui::{self, explorer};
 
 pub struct AnalyzeOutput {
@@ -123,9 +127,22 @@ pub fn run_interactive(ctx: &Ctx, path: Option<PathBuf>) -> anyhow::Result<Analy
 
     let now = jiff::Timestamp::now().as_second();
     let mut session = explorer::ExplorerSession::new(totals, now);
+    let run_id = jiff::Timestamp::now().to_string();
+    let mut effector = RealAnalyzeEffector {
+        ctx,
+        start: target.clone(),
+        run_id: run_id.clone(),
+    };
 
     let mut terminal = tui::init_terminal()?;
-    let loop_result = drive_explorer(&mut terminal, &mut session, &rx, scan_thread, &cancel);
+    let loop_result = drive_explorer(
+        &mut terminal,
+        &mut session,
+        &rx,
+        scan_thread,
+        &cancel,
+        &mut effector,
+    );
     // Leave the alternate screen before printing anything: warnings and the
     // final summary both need a normal, scrollable terminal.
     tui::restore_terminal(&mut terminal)?;
@@ -154,6 +171,7 @@ fn drive_explorer(
     rx: &mpsc::Receiver<(u64, u64)>,
     scan_thread: std::thread::JoinHandle<ScanResult>,
     cancel: &Arc<AtomicBool>,
+    effector: &mut dyn explorer::AnalyzeEffector,
 ) -> anyhow::Result<(Vec<String>, Vec<PathBuf>)> {
     let colors = tui::colors_enabled_now();
     let mut scan_thread = Some(scan_thread);
@@ -195,6 +213,11 @@ fn drive_explorer(
             continue;
         }
 
+        // A delete prompt swallows every key until it's resolved.
+        if explorer::handle_prompt_key(session, key, effector) {
+            continue;
+        }
+
         let action = explorer::map_key(key);
 
         if session.is_scanning() {
@@ -202,6 +225,11 @@ fn drive_explorer(
                 cancel.store(true, Ordering::Relaxed);
                 session.request_cancel();
             }
+            continue;
+        }
+
+        if action == Some(explorer::Action::Delete) {
+            session.request_delete();
             continue;
         }
 
@@ -218,8 +246,85 @@ fn drive_explorer(
             Some(explorer::Action::Top) => state.top(),
             Some(explorer::Action::Bottom) => state.bottom(),
             Some(explorer::Action::Quit) => return Ok((warnings, skipped_mounts)),
-            // Delete lands in the next slice.
             Some(explorer::Action::Delete) | None => {}
+        }
+    }
+}
+
+/// The real delete seam behind the explorer's `d` key: trash via the
+/// engine's `trash_path` (which validates and journals itself), and — for
+/// cross-filesystem sources only — a validated, journaled permanent delete
+/// through `safety::deleter::delete_tree`.
+struct RealAnalyzeEffector<'a> {
+    ctx: &'a Ctx,
+    /// The directory this analyze session was started on — the only prefix
+    /// deletes are allowed inside.
+    start: PathBuf,
+    run_id: String,
+}
+
+impl RealAnalyzeEffector<'_> {
+    fn record(&self, path: &Path, bytes: u64, outcome: String) -> Record {
+        Record::now(
+            self.run_id.clone(),
+            "analyze".to_string(),
+            "analyze.delete".to_string(),
+            "delete".to_string(),
+            None,
+            Some(vec![path.display().to_string()]),
+            false,
+            false,
+            bytes,
+            outcome,
+        )
+    }
+
+    /// Writes a record to the journal; a failed audit-trail write must not
+    /// fail the delete it describes (matches `analyze::trash`'s convention).
+    fn journal_or_warn(&self, record: &Record) {
+        if let Err(e) = Journal::new(&self.ctx.state_dir).append(record) {
+            eprintln!("warning: failed to record audit trail: {e:#}");
+        }
+    }
+}
+
+impl explorer::AnalyzeEffector for RealAnalyzeEffector<'_> {
+    fn trash(&mut self, path: &Path) -> Result<u64, explorer::TrashError> {
+        match trash::trash_path(self.ctx, &self.start, path, &self.run_id) {
+            Ok(outcome) => Ok(outcome.bytes),
+            Err(e) if e.downcast_ref::<trash::CrossFilesystem>().is_some() => {
+                Err(explorer::TrashError::CrossFilesystem)
+            }
+            Err(e) => Err(explorer::TrashError::Failed(format!("{e:#}"))),
+        }
+    }
+
+    fn delete_permanent(&mut self, path: &Path) -> Result<u64, String> {
+        let env = SafetyEnv::from_system(self.ctx).map_err(|e| format!("{e:#}"))?;
+        if let Err(refusal) =
+            validate_deletable(path, std::slice::from_ref(&self.start), Tier::User, &env)
+        {
+            self.journal_or_warn(&self.record(path, 0, format!("refused: {refusal}")));
+            return Err(format!("refused: {refusal}"));
+        }
+
+        let report = delete_tree(path);
+        if report.errors.is_empty() {
+            self.journal_or_warn(&self.record(path, report.bytes_freed, "ok".to_string()));
+            Ok(report.bytes_freed)
+        } else {
+            let detail = report
+                .errors
+                .iter()
+                .map(|(p, e)| format!("{}: {e}", p.display()))
+                .collect::<Vec<_>>()
+                .join("; ");
+            self.journal_or_warn(&self.record(
+                path,
+                report.bytes_freed,
+                format!("error: {detail}"),
+            ));
+            Err(detail)
         }
     }
 }
@@ -431,5 +536,122 @@ Directories:
 
 Largest files: (none)";
         assert_eq!(rendered, expected);
+    }
+
+    // --- RealAnalyzeEffector ---
+
+    use crate::tui::explorer::{AnalyzeEffector, TrashError};
+
+    struct Fixture {
+        _sandbox: tempfile::TempDir,
+        ctx: Ctx,
+    }
+
+    fn fixture() -> Fixture {
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path().join("root");
+        let home = root.join("home/user");
+        std::fs::create_dir_all(&home).unwrap();
+        let ctx = Ctx {
+            root,
+            home,
+            config_dir: sandbox.path().join("config"),
+            state_dir: sandbox.path().join("state"),
+            dry_run: false,
+            debug: false,
+            config: crate::config::Config::default(),
+            sandboxed: true,
+            available_commands: None,
+            fake_command_output: None,
+        };
+        Fixture {
+            _sandbox: sandbox,
+            ctx,
+        }
+    }
+
+    fn effector<'a>(f: &'a Fixture, start: &Path) -> RealAnalyzeEffector<'a> {
+        RealAnalyzeEffector {
+            ctx: &f.ctx,
+            start: start.to_path_buf(),
+            run_id: "run-1".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_real_effector_trash_moves_file_into_trash() {
+        let f = fixture();
+        let stuff = f.ctx.home.join("stuff");
+        std::fs::create_dir_all(&stuff).unwrap();
+        let target = stuff.join("junk.txt");
+        std::fs::write(&target, b"hello").unwrap();
+
+        let mut effector = effector(&f, &f.ctx.home);
+        let freed = effector.trash(&target).unwrap();
+
+        assert!(freed > 0);
+        assert!(!target.exists());
+        assert!(
+            f.ctx
+                .home
+                .join(".local/share/Trash/files/junk.txt")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn test_real_effector_trash_refusal_is_failed_not_cross_filesystem() {
+        let f = fixture();
+        let ssh = f.ctx.home.join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let target = ssh.join("id_rsa");
+        std::fs::write(&target, b"secret").unwrap();
+
+        let mut effector = effector(&f, &f.ctx.home);
+        let err = effector.trash(&target).unwrap_err();
+
+        assert!(matches!(err, TrashError::Failed(ref msg) if msg.contains("refused")));
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn test_real_effector_delete_permanent_removes_tree_and_journals() {
+        let f = fixture();
+        let stuff = f.ctx.home.join("stuff");
+        let olddir = stuff.join("olddir");
+        std::fs::create_dir_all(&olddir).unwrap();
+        std::fs::write(olddir.join("f.txt"), vec![0u8; 4096]).unwrap();
+
+        let mut effector = effector(&f, &f.ctx.home);
+        let freed = effector.delete_permanent(&olddir).unwrap();
+
+        assert!(freed > 0);
+        assert!(!olddir.exists());
+        let (records, _) = Journal::new(&f.ctx.state_dir).read_all().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].cmd, "analyze");
+        assert_eq!(records[0].rule, "analyze.delete");
+        assert_eq!(records[0].outcome, "ok");
+        assert!(records[0].bytes_freed > 0);
+    }
+
+    #[test]
+    fn test_real_effector_delete_permanent_refuses_outside_start_prefix() {
+        let f = fixture();
+        let start = f.ctx.home.join("stuff");
+        let other = f.ctx.home.join("other");
+        std::fs::create_dir_all(&start).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let target = other.join("file.txt");
+        std::fs::write(&target, b"data").unwrap();
+
+        let mut effector = effector(&f, &start);
+        let err = effector.delete_permanent(&target).unwrap_err();
+
+        assert!(err.contains("refused"));
+        assert!(target.exists());
+        let (records, _) = Journal::new(&f.ctx.state_dir).read_all().unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].outcome.starts_with("refused:"));
     }
 }

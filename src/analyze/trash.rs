@@ -15,6 +15,13 @@ pub struct TrashOutcome {
     pub bytes: u64,
 }
 
+/// Typed refusal for a source on a different filesystem from the trash
+/// directory, so the explorer TUI can downcast it and offer a permanent
+/// delete instead of parsing the error message.
+#[derive(Debug, thiserror::Error)]
+#[error("can't trash across filesystems — delete permanently from the TUI instead")]
+pub struct CrossFilesystem;
+
 /// Whether two `st_dev` values refer to the same filesystem.
 fn same_device(a: u64, b: u64) -> bool {
     a == b
@@ -129,12 +136,11 @@ pub fn trash_path(
         .with_context(|| format!("failed to stat {}", files_dir.display()))?
         .dev();
     if !same_device(source_dev, trash_dev) {
-        let msg = "can't trash across filesystems — delete permanently from the TUI instead";
         journal_or_warn(
             ctx,
             &record(0, "refused: can't trash across filesystems".to_string()),
         );
-        bail!(msg);
+        return Err(CrossFilesystem.into());
     }
 
     let bytes = dir_size(path);
