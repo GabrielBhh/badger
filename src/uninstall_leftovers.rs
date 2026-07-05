@@ -107,12 +107,14 @@ fn push_if_exists(found: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
-/// Every entry directly under `dir` whose file name starts with one of
-/// `name_variants` and ends with `suffix` (`""` means no suffix
-/// constraint) — e.g. `foo*` under `~/.config/systemd/user`, or
-/// `foo*.desktop` under `~/.local/share/applications`. A partial match like
-/// `firefoxx` for name `firefox` is intentionally excluded: `starts_with`
-/// only ever matches on the name's own prefix, never the reverse.
+/// Every entry directly under `dir` whose file name is one of
+/// `name_variants` at a genuine word boundary (see `matches_name_boundary`)
+/// and ends with `suffix` (`""` means no suffix constraint) — e.g.
+/// `foo.service`/`foo@x.service` under `~/.config/systemd/user`, or
+/// `foo.desktop` under `~/.local/share/applications`. A same-prefix
+/// lookalike like `github-desktop.service` for name `git`, or
+/// `code-oss.desktop` for name `code`, is intentionally excluded: a bare
+/// `starts_with` would wrongly match those.
 fn glob_prefix(dir: &Path, name_variants: &[String], suffix: &str) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -124,11 +126,23 @@ fn glob_prefix(dir: &Path, name_variants: &[String], suffix: &str) -> Vec<PathBu
             let file_name = file_name.to_string_lossy();
             name_variants
                 .iter()
-                .any(|n| file_name.starts_with(n.as_str()))
+                .any(|n| matches_name_boundary(&file_name, n))
                 && file_name.ends_with(suffix)
         })
         .map(|entry| entry.path())
         .collect()
+}
+
+/// True when `file_name` is exactly `name`, or `name` immediately followed
+/// by `.` or `@` — the only two ways a unit/desktop file name legitimately
+/// extends a package's own name (`name.service`, `name.desktop`,
+/// `name@instance.service`). Excludes same-prefix lookalikes such as
+/// `code-oss.desktop` or `github-desktop.service`.
+fn matches_name_boundary(file_name: &str, name: &str) -> bool {
+    let Some(remainder) = file_name.strip_prefix(name) else {
+        return false;
+    };
+    remainder.is_empty() || remainder.starts_with('.') || remainder.starts_with('@')
 }
 
 #[cfg(test)]
@@ -298,6 +312,46 @@ mod tests {
         assert!(group.candidates.is_empty());
         assert!(group.skipped.is_empty());
         assert_eq!(group.risk, Risk::Moderate);
+    }
+
+    #[test]
+    // Bug: glob_prefix used file_name.starts_with(name), so uninstalling
+    // "git" would offer github-desktop.service (a same-prefix lookalike
+    // service, not git's own leftover) as a deletable candidate. Root cause:
+    // no boundary check after the prefix match.
+    fn test_github_desktop_service_is_not_matched_for_git() {
+        let f = fixture();
+        std::fs::create_dir_all(f.ctx.home.join(".config/systemd/user")).unwrap();
+        std::fs::write(
+            f.ctx
+                .home
+                .join(".config/systemd/user/github-desktop.service"),
+            b"[Unit]",
+        )
+        .unwrap();
+
+        let group = scan(&f.ctx, "git", "git", Backend::Pacman).unwrap();
+        assert!(group.candidates.is_empty());
+    }
+
+    #[test]
+    // Bug: glob_prefix used file_name.starts_with(name), so uninstalling
+    // "code" would offer code-oss.desktop (a different, still-installed
+    // package's desktop entry) as a deletable candidate. Root cause: no
+    // boundary check after the prefix match.
+    fn test_code_oss_desktop_is_not_matched_for_code() {
+        let f = fixture();
+        std::fs::create_dir_all(f.ctx.home.join(".local/share/applications")).unwrap();
+        std::fs::write(
+            f.ctx
+                .home
+                .join(".local/share/applications/code-oss.desktop"),
+            b"[Desktop Entry]",
+        )
+        .unwrap();
+
+        let group = scan(&f.ctx, "code", "code", Backend::Pacman).unwrap();
+        assert!(group.candidates.is_empty());
     }
 
     #[test]
