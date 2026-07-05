@@ -5,15 +5,18 @@
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
+use crossterm::event::{Event, KeyEventKind};
 use serde::Serialize;
 
 use crate::analyze::disk::{self, DiskTotals};
 use crate::analyze::sizer::{self, DirNode, LargeFile, ScanOptions, ScanResult};
 use crate::ctx::Ctx;
 use crate::output::{self, Mode};
+use crate::tui::{self, explorer};
 
 pub struct AnalyzeOutput {
     pub rendered: String,
@@ -30,7 +33,9 @@ struct JsonOutput<'a> {
     complete: bool,
 }
 
-pub fn run(ctx: &Ctx, path: Option<PathBuf>, mode: Mode) -> anyhow::Result<AnalyzeOutput> {
+/// Validates the analyze target: it must exist and canonicalize to
+/// somewhere inside the analyzable area (under the root or home).
+fn validated_target(ctx: &Ctx, path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     let requested = path.unwrap_or_else(|| ctx.home.clone());
     if !requested.exists() {
         anyhow::bail!("{}: no such file or directory", requested.display());
@@ -43,6 +48,11 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, mode: Mode) -> anyhow::Result<Analy
             ctx.home.display()
         );
     }
+    Ok(target)
+}
+
+pub fn run(ctx: &Ctx, path: Option<PathBuf>, mode: Mode) -> anyhow::Result<AnalyzeOutput> {
+    let target = validated_target(ctx, path)?;
 
     let (tx, rx) = mpsc::channel::<(u64, u64)>();
     let show_progress = std::io::stderr().is_terminal();
@@ -89,6 +99,129 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, mode: Mode) -> anyhow::Result<Analy
     };
 
     Ok(AnalyzeOutput { rendered })
+}
+
+/// Interactive `badger analyze`: the scan runs on a background thread while
+/// the TUI shows live progress counters, then the explorer opens over the
+/// finished (or cancelled-partial) tree.
+pub fn run_interactive(ctx: &Ctx, path: Option<PathBuf>) -> anyhow::Result<AnalyzeOutput> {
+    let target = validated_target(ctx, path)?;
+    let totals = disk::disk_totals(ctx, &target)?;
+
+    let (tx, rx) = mpsc::channel::<(u64, u64)>();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let scan_cancel = Arc::clone(&cancel);
+    let scan_target = target.clone();
+    let scan_thread = std::thread::spawn(move || {
+        sizer::scan(
+            &scan_target,
+            &ScanOptions::default(),
+            Some(tx),
+            &scan_cancel,
+        )
+    });
+
+    let now = jiff::Timestamp::now().as_second();
+    let mut session = explorer::ExplorerSession::new(totals, now);
+
+    let mut terminal = tui::init_terminal()?;
+    let loop_result = drive_explorer(&mut terminal, &mut session, &rx, scan_thread, &cancel);
+    // Leave the alternate screen before printing anything: warnings and the
+    // final summary both need a normal, scrollable terminal.
+    tui::restore_terminal(&mut terminal)?;
+    let (warnings, skipped_mounts) = loop_result?;
+
+    for warning in &warnings {
+        eprintln!("warning: {warning}");
+    }
+    for p in &skipped_mounts {
+        eprintln!("warning: skipped mount: {}", p.display());
+    }
+
+    Ok(AnalyzeOutput {
+        rendered: String::new(),
+    })
+}
+
+/// Drives the scanning-then-browsing event loop against a real terminal:
+/// alternates between draining the scan's progress channel and polling for
+/// key events, swapping the explorer in when the scan thread finishes. All
+/// state transitions live on `ExplorerSession`/`ExplorerState` (unit-tested
+/// separately); this loop is only the thread/terminal glue.
+fn drive_explorer(
+    terminal: &mut tui::Term,
+    session: &mut explorer::ExplorerSession,
+    rx: &mpsc::Receiver<(u64, u64)>,
+    scan_thread: std::thread::JoinHandle<ScanResult>,
+    cancel: &Arc<AtomicBool>,
+) -> anyhow::Result<(Vec<String>, Vec<PathBuf>)> {
+    let colors = tui::colors_enabled_now();
+    let mut scan_thread = Some(scan_thread);
+    let mut warnings = Vec::new();
+    let mut skipped_mounts = Vec::new();
+
+    loop {
+        while let Ok((dirs, bytes)) = rx.try_recv() {
+            session.on_progress(dirs, bytes);
+        }
+
+        if session.is_scanning()
+            && scan_thread.as_ref().is_some_and(|h| h.is_finished())
+            && let Some(handle) = scan_thread.take()
+        {
+            let scan = handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("scan thread panicked"))?;
+            warnings = scan.warnings;
+            skipped_mounts = scan.skipped_mounts;
+            session.on_finished(scan.root, scan.top_files, scan.complete);
+        }
+
+        let height = terminal.size()?.height;
+        if let Some(state) = session.explorer_mut() {
+            state.scroll_into_view(explorer::body_height(height));
+        }
+        terminal.draw(|f| explorer::render_session(f, session, colors))?;
+
+        // Poll rather than block: progress ticks and scan completion have to
+        // keep landing even while no key is pressed.
+        if !crossterm::event::poll(Duration::from_millis(100))? {
+            continue;
+        }
+        let Event::Key(key) = crossterm::event::read()? else {
+            continue;
+        };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+
+        let action = explorer::map_key(key);
+
+        if session.is_scanning() {
+            if action == Some(explorer::Action::Quit) {
+                cancel.store(true, Ordering::Relaxed);
+                session.request_cancel();
+            }
+            continue;
+        }
+
+        let Some(state) = session.explorer_mut() else {
+            continue;
+        };
+        match action {
+            Some(explorer::Action::Down) => state.move_down(),
+            Some(explorer::Action::Up) => state.move_up(),
+            Some(explorer::Action::Descend) => state.descend(),
+            Some(explorer::Action::Ascend) => state.ascend(),
+            Some(explorer::Action::CycleSort) => state.cycle_sort(),
+            Some(explorer::Action::ToggleLargeFiles) => state.toggle_large_files(),
+            Some(explorer::Action::Top) => state.top(),
+            Some(explorer::Action::Bottom) => state.bottom(),
+            Some(explorer::Action::Quit) => return Ok((warnings, skipped_mounts)),
+            // Delete lands in the next slice.
+            Some(explorer::Action::Delete) | None => {}
+        }
+    }
 }
 
 /// Renders the plain-text report: totals line, disk line, a table of the

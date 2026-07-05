@@ -12,6 +12,143 @@ use crate::output::humanize_bytes;
 
 const BAR_WIDTH: usize = 20;
 
+/// Pure state for the pre-browsing "scanning" screen: the progress counters
+/// the engine's scan reports over its channel, and whether the person has
+/// asked to cancel. No threads or terminal I/O here — the thread spawn/join
+/// and crossterm event loop that feed these messages in live in
+/// `commands::analyze`, which is why this only needs plain method calls to
+/// be fully unit-tested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScanProgress {
+    dirs: u64,
+    bytes: u64,
+    cancel_requested: bool,
+}
+
+impl ScanProgress {
+    pub fn new() -> ScanProgress {
+        ScanProgress::default()
+    }
+
+    pub fn on_progress(&mut self, dirs: u64, bytes: u64) {
+        self.dirs = dirs;
+        self.bytes = bytes;
+    }
+
+    pub fn request_cancel(&mut self) {
+        self.cancel_requested = true;
+    }
+
+    pub fn cancel_requested(&self) -> bool {
+        self.cancel_requested
+    }
+
+    pub fn dirs(&self) -> u64 {
+        self.dirs
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+/// The full lifecycle of one interactive analyze session as a message-driven
+/// state machine: starts scanning, absorbs `(dirs, bytes)` progress ticks,
+/// and swaps to a browsable `ExplorerState` when the scan's final tree
+/// lands. The threading (scan worker, progress channel, crossterm polling)
+/// lives in `commands::analyze`; everything here is plain method calls, so
+/// the whole scanning-to-browsing transition is unit-testable without
+/// threads.
+pub struct ExplorerSession {
+    progress: ScanProgress,
+    explorer: Option<ExplorerState>,
+    totals: DiskTotals,
+    now: i64,
+}
+
+impl ExplorerSession {
+    pub fn new(totals: DiskTotals, now: i64) -> ExplorerSession {
+        ExplorerSession {
+            progress: ScanProgress::new(),
+            explorer: None,
+            totals,
+            now,
+        }
+    }
+
+    pub fn is_scanning(&self) -> bool {
+        self.explorer.is_none()
+    }
+
+    /// A `(dirs, bytes)` tick from the scan's progress channel. Ignored once
+    /// the final tree has landed (a straggling tick can arrive after the
+    /// scan thread finishes).
+    pub fn on_progress(&mut self, dirs: u64, bytes: u64) {
+        if self.is_scanning() {
+            self.progress.on_progress(dirs, bytes);
+        }
+    }
+
+    /// The scan finished (or was cancelled): swap in its tree — possibly
+    /// partial — and start browsing.
+    pub fn on_finished(&mut self, root: DirNode, top_files: Vec<LargeFile>, complete: bool) {
+        self.explorer = Some(ExplorerState::new(
+            root,
+            self.totals.clone(),
+            top_files,
+            complete,
+            self.now,
+        ));
+    }
+
+    pub fn request_cancel(&mut self) {
+        self.progress.request_cancel();
+    }
+
+    pub fn cancel_requested(&self) -> bool {
+        self.progress.cancel_requested()
+    }
+
+    pub fn progress(&self) -> &ScanProgress {
+        &self.progress
+    }
+
+    pub fn explorer_mut(&mut self) -> Option<&mut ExplorerState> {
+        self.explorer.as_mut()
+    }
+
+    pub fn explorer(&self) -> Option<&ExplorerState> {
+        self.explorer.as_ref()
+    }
+}
+
+/// Renders whichever screen the session is on: the scanning counters, or
+/// the explorer once the tree has landed.
+pub fn render_session(frame: &mut Frame, session: &ExplorerSession, colors: bool) {
+    match session.explorer() {
+        Some(state) => render(frame, state, colors),
+        None => render_scanning(frame, session.progress()),
+    }
+}
+
+pub fn render_scanning(frame: &mut Frame, progress: &ScanProgress) {
+    let lines = vec![
+        Line::from("badger analyze — scanning\u{2026}"),
+        Line::from(format!(
+            "{} dirs, {} so far",
+            progress.dirs(),
+            humanize_bytes(progress.bytes())
+        )),
+        Line::from(""),
+        if progress.cancel_requested() {
+            Line::from("cancelling\u{2026} waiting for the scan to stop")
+        } else {
+            Line::from("q/esc cancel")
+        },
+    ];
+    frame.render_widget(Paragraph::new(lines), frame.area());
+}
+
 /// How the current directory's rows are ordered. Cycled with `s`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortMode {
@@ -878,5 +1015,129 @@ mod tests {
         let text = full_text(&draw(&s));
         assert!(text.contains("largest files"));
         assert!(text.contains("/scan/root/big/f1.bin"));
+    }
+
+    // --- ScanProgress ---
+
+    #[test]
+    fn test_scan_progress_starts_at_zero_and_not_cancelled() {
+        let p = ScanProgress::new();
+        assert_eq!(p.dirs(), 0);
+        assert_eq!(p.bytes(), 0);
+        assert!(!p.cancel_requested());
+    }
+
+    #[test]
+    fn test_scan_progress_on_progress_updates_counters() {
+        let mut p = ScanProgress::new();
+        p.on_progress(100, 4096);
+        assert_eq!(p.dirs(), 100);
+        assert_eq!(p.bytes(), 4096);
+    }
+
+    #[test]
+    fn test_scan_progress_request_cancel_is_sticky() {
+        let mut p = ScanProgress::new();
+        p.request_cancel();
+        assert!(p.cancel_requested());
+        p.on_progress(1, 1);
+        assert!(p.cancel_requested());
+    }
+
+    #[test]
+    fn test_render_scanning_shows_counters_and_cancel_hint() {
+        let mut p = ScanProgress::new();
+        p.on_progress(42, 8192);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_scanning(f, &p)).unwrap();
+        let text = full_text(&terminal.backend().buffer().clone());
+        assert!(text.contains("scanning"));
+        assert!(text.contains("42 dirs, 8.0 KiB so far"));
+        assert!(text.contains("q/esc cancel"));
+    }
+
+    #[test]
+    fn test_render_scanning_shows_cancelling_hint_once_requested() {
+        let mut p = ScanProgress::new();
+        p.request_cancel();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_scanning(f, &p)).unwrap();
+        let text = full_text(&terminal.backend().buffer().clone());
+        assert!(text.contains("cancelling"));
+        assert!(!text.contains("q/esc cancel"));
+    }
+
+    // --- ExplorerSession ---
+
+    #[test]
+    fn test_session_starts_scanning_with_no_explorer() {
+        let session = ExplorerSession::new(totals(), 10_000);
+        assert!(session.is_scanning());
+        assert!(session.explorer().is_none());
+        assert!(!session.cancel_requested());
+    }
+
+    #[test]
+    fn test_session_progress_ticks_update_counters_while_scanning() {
+        let mut session = ExplorerSession::new(totals(), 10_000);
+        session.on_progress(200, 65536);
+        assert_eq!(session.progress().dirs(), 200);
+        assert_eq!(session.progress().bytes(), 65536);
+    }
+
+    #[test]
+    fn test_session_finished_swaps_in_a_browsable_explorer() {
+        let mut session = ExplorerSession::new(totals(), 10_000);
+        session.on_finished(sample_root(), Vec::new(), true);
+        assert!(!session.is_scanning());
+        let explorer = session.explorer().unwrap();
+        assert!(explorer.is_complete());
+        assert_eq!(explorer.current_path(), PathBuf::from("/scan/root"));
+    }
+
+    #[test]
+    fn test_session_cancelled_scan_lands_as_partial_tree() {
+        let mut session = ExplorerSession::new(totals(), 10_000);
+        session.request_cancel();
+        assert!(session.cancel_requested());
+        session.on_finished(sample_root(), Vec::new(), false);
+        assert!(!session.explorer().unwrap().is_complete());
+    }
+
+    #[test]
+    fn test_session_ignores_straggler_progress_after_finish() {
+        let mut session = ExplorerSession::new(totals(), 10_000);
+        session.on_progress(100, 1000);
+        session.on_finished(sample_root(), Vec::new(), true);
+        session.on_progress(999, 999_999);
+        assert_eq!(session.progress().dirs(), 100);
+        assert_eq!(session.progress().bytes(), 1000);
+    }
+
+    fn draw_session(session: &ExplorerSession) -> Buffer {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_session(f, session, true)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn test_render_session_shows_scanning_screen_before_tree_lands() {
+        let mut session = ExplorerSession::new(totals(), 10_000);
+        session.on_progress(42, 8192);
+        let text = full_text(&draw_session(&session));
+        assert!(text.contains("scanning"));
+        assert!(text.contains("42 dirs"));
+    }
+
+    #[test]
+    fn test_render_session_shows_explorer_after_tree_lands() {
+        let mut session = ExplorerSession::new(totals(), 10_000);
+        session.on_finished(sample_root(), Vec::new(), true);
+        let text = full_text(&draw_session(&session));
+        assert!(!text.contains("scanning"));
+        assert!(text.contains("> big"));
     }
 }
