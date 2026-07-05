@@ -8,6 +8,9 @@
 use crate::analyze::disk::{self, DiskTotals};
 use crate::ctx::Ctx;
 
+// Per the kernel's Documentation/admin-guide/iostats.rst, /proc/diskstats
+// sector counts are always in 512-byte units regardless of the device's
+// real sector size.
 const SECTOR_BYTES: u64 = 512;
 
 /// Raw sector counters for one block device.
@@ -102,7 +105,7 @@ pub fn disk_rates(prev: &DiskSample, curr: &DiskSample, interval_secs: f64) -> V
                     return 0.0;
                 }
                 let delta = curr_sectors.saturating_sub(prev_sectors);
-                (delta * SECTOR_BYTES) as f64 / interval_secs
+                delta.saturating_mul(SECTOR_BYTES) as f64 / interval_secs
             };
             Some(DeviceRate {
                 name: c.name.clone(),

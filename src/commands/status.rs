@@ -74,17 +74,20 @@ pub(crate) fn fetch_failed_units(ctx: &Ctx) -> Option<usize> {
 
 /// Builds the full status report from a pair of samples `interval_secs`
 /// apart. Split out from `run` so tests can drive it with fabricated
-/// samples instead of a real 500ms sleep. `failed_units` is passed in
-/// rather than fetched here because it forks `systemctl`: the one-shot
-/// path fetches it once, the live dashboard refreshes it only every few
-/// ticks through the session's cache.
+/// samples instead of a real 500ms sleep. `disk_totals` and `failed_units`
+/// are passed in rather than fetched here because the two paths treat them
+/// differently: the one-shot path hard-fails on a disk-read error and
+/// fetches failed units once, while the live dashboard degrades to the
+/// previous tick's totals (`build_dashboard_report`) and refreshes failed
+/// units only every few ticks through the session's cache.
 pub(crate) fn build_report(
     ctx: &Ctx,
     before: &Samples,
     after: &Samples,
     interval_secs: f64,
+    disk_totals: crate::analyze::disk::DiskTotals,
     failed_units: Option<usize>,
-) -> anyhow::Result<StatusReport> {
+) -> StatusReport {
     let cpu_pcts = cpu::cpu_percent(&before.cpu, &after.cpu);
     let cpu_total_pct = cpu_pcts.first().copied().unwrap_or(0.0);
     let cpu_per_core_pct = cpu_pcts.get(1..).unwrap_or(&[]).to_vec();
@@ -101,7 +104,6 @@ pub(crate) fn build_report(
 
     let psi_all = psi::read_all(ctx);
 
-    let disk_totals = disk::root_fill(ctx)?;
     let disk_used_pct = if disk_totals.total == 0 {
         0.0
     } else {
@@ -134,7 +136,7 @@ pub(crate) fn build_report(
     };
     let (health_score, health_reasons) = health::health_score(&health_inputs);
 
-    Ok(StatusReport {
+    StatusReport {
         health_score,
         health_reasons,
         cpu_total_pct,
@@ -151,20 +153,38 @@ pub(crate) fn build_report(
         kernel,
         scx,
         failed_units,
-    })
+    }
+}
+
+/// `build_report` for the live dashboard: a transient disk-read failure
+/// (statvfs/mounts briefly unavailable) reuses `last_disk` instead of
+/// killing the whole session. The one-shot path keeps the hard error — a
+/// single sample with no disk data is worthless.
+pub(crate) fn build_dashboard_report(
+    ctx: &Ctx,
+    before: &Samples,
+    after: &Samples,
+    interval_secs: f64,
+    last_disk: &crate::analyze::disk::DiskTotals,
+    failed_units: Option<usize>,
+) -> StatusReport {
+    let disk_totals = disk::root_fill(ctx).unwrap_or_else(|_| last_disk.clone());
+    build_report(ctx, before, after, interval_secs, disk_totals, failed_units)
 }
 
 pub fn run(ctx: &Ctx, mode: Mode) -> anyhow::Result<StatusOutput> {
     let before = take_samples(ctx);
     std::thread::sleep(SAMPLE_INTERVAL);
     let after = take_samples(ctx);
+    let disk_totals = disk::root_fill(ctx)?;
     let report = build_report(
         ctx,
         &before,
         &after,
         SAMPLE_INTERVAL.as_secs_f64(),
+        disk_totals,
         fetch_failed_units(ctx),
-    )?;
+    );
 
     let rendered = match mode {
         Mode::Json => serde_json::to_string(&report)?,
@@ -239,6 +259,9 @@ fn drive_dashboard(
     terminal.draw(|f| dashboard::render(f, session.state(), colors))?;
 
     let mut prev = take_samples(ctx);
+    // Zeroed until the first successful disk read; a tick whose read fails
+    // reuses whatever the previous tick showed.
+    let mut last_disk = crate::analyze::disk::DiskTotals::default();
     loop {
         if !wait_for_next_tick(TICK_INTERVAL)? {
             return Ok(());
@@ -248,7 +271,15 @@ fn drive_dashboard(
         // failed_units forks systemctl, so the session caches it and only
         // re-fetches every 10th tick instead of once a second.
         let failed_units = session.failed_units_for_tick(|| fetch_failed_units(ctx));
-        let report = build_report(ctx, &prev, &curr, TICK_INTERVAL.as_secs_f64(), failed_units)?;
+        let report = build_dashboard_report(
+            ctx,
+            &prev,
+            &curr,
+            TICK_INTERVAL.as_secs_f64(),
+            &last_disk,
+            failed_units,
+        );
+        last_disk = report.disk_totals.clone();
         let proc_sample = procs::sample_all(ctx);
         session.on_tick(&report, proc_sample, TICK_INTERVAL.as_secs_f64());
         prev = curr;
@@ -459,7 +490,15 @@ mod tests {
         write_system(&ctx, 1500, 9000, 1100, 3000);
         let after = take_samples(&ctx);
 
-        let report = build_report(&ctx, &before, &after, 2.0, fetch_failed_units(&ctx)).unwrap();
+        let disk_totals = disk::root_fill(&ctx).unwrap();
+        let report = build_report(
+            &ctx,
+            &before,
+            &after,
+            2.0,
+            disk_totals,
+            fetch_failed_units(&ctx),
+        );
 
         // total delta = 500 (busy) + 0 (idle unchanged) = 500; busy delta 500
         // -> 100%.
@@ -496,7 +535,14 @@ mod tests {
         let before = take_samples(&ctx);
         let after = take_samples(&ctx);
 
-        let report = build_report(&ctx, &before, &after, 1.0, None).unwrap();
+        let report = build_report(
+            &ctx,
+            &before,
+            &after,
+            1.0,
+            disk::root_fill(&ctx).unwrap(),
+            None,
+        );
         let json = serde_json::to_string(&report).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["health_score"], 100);
@@ -510,7 +556,14 @@ mod tests {
         write_system(&ctx, 0, 0, 0, 0);
         let before = take_samples(&ctx);
         let after = take_samples(&ctx);
-        let report = build_report(&ctx, &before, &after, 1.0, None).unwrap();
+        let report = build_report(
+            &ctx,
+            &before,
+            &after,
+            1.0,
+            disk::root_fill(&ctx).unwrap(),
+            None,
+        );
 
         let rendered = render_human(&report);
         assert!(rendered.contains("Health: 100/100"));
@@ -525,5 +578,29 @@ mod tests {
 
         let output = run(&ctx, Mode::Human).unwrap();
         assert!(output.rendered.contains("Health:"));
+    }
+
+    // Regression: a transient statvfs/mounts failure between dashboard
+    // ticks used to abort the whole live session via build_report's `?`.
+    // The dashboard path must instead reuse the previous tick's totals.
+    #[test]
+    fn test_dashboard_report_reuses_previous_disk_totals_when_read_fails() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = fixture_ctx(&root);
+        write_system(&ctx, 0, 0, 0, 0);
+        let before = take_samples(&ctx);
+        let after = take_samples(&ctx);
+
+        let zeroed = crate::analyze::disk::DiskTotals::default();
+        let first = build_dashboard_report(&ctx, &before, &after, 1.0, &zeroed, None);
+        assert_eq!(first.disk_totals.fs_kind, "ext4");
+        assert!(first.disk_totals.total > 0);
+
+        // The fabricated root disappears between ticks: statvfs now fails.
+        std::fs::remove_dir_all(&root).unwrap();
+        let second = build_dashboard_report(&ctx, &before, &after, 1.0, &first.disk_totals, None);
+        assert_eq!(second.disk_totals, first.disk_totals);
     }
 }
