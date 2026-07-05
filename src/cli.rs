@@ -39,7 +39,11 @@ pub enum Command {
     /// Show current system status
     Status,
     /// Aggressively purge reclaimable space
-    Purge,
+    Purge {
+        /// Actually delete pre-checked (non-recent) selections (default just plans)
+        #[arg(long)]
+        yes: bool,
+    },
     /// Analyze disk usage for a directory
     Analyze {
         /// Directory to analyze (defaults to your home)

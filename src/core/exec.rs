@@ -3,7 +3,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
-use crate::core::item::{Group, Risk};
+use crate::core::item::{Candidate, Group, Risk};
 use crate::core::runner::CommandRunner;
 use crate::ctx::Ctx;
 use crate::privilege;
@@ -38,9 +38,18 @@ pub struct PrivilegedDelete {
 }
 
 /// Carries out one selected action. `DryRunEffector` only records what would
-/// happen; `RealEffector` actually deletes/runs.
+/// happen; `RealEffector` actually deletes/runs. `delete` takes
+/// `requires_sudo`/`allowed_prefixes` directly (rather than a `&Rule`) so
+/// callers with no static `Rule` of their own — `badger purge`'s
+/// context-gated candidates, for instance — can drive the same effector.
 pub trait Effector {
-    fn delete(&mut self, rule: &Rule, path: &Path, estimated_bytes: u64) -> DeleteOutcome;
+    fn delete(
+        &mut self,
+        requires_sudo: bool,
+        allowed_prefixes: &[PathBuf],
+        path: &Path,
+        estimated_bytes: u64,
+    ) -> DeleteOutcome;
     fn run(&mut self, spec: &CmdSpec) -> RunOutcome;
     /// Deletes paths that require root privilege via the privileged helper
     /// subprocess (see `privilege.rs`), one outcome per `op`, same order.
@@ -50,7 +59,13 @@ pub trait Effector {
 pub struct DryRunEffector;
 
 impl Effector for DryRunEffector {
-    fn delete(&mut self, _rule: &Rule, _path: &Path, estimated_bytes: u64) -> DeleteOutcome {
+    fn delete(
+        &mut self,
+        _requires_sudo: bool,
+        _allowed_prefixes: &[PathBuf],
+        _path: &Path,
+        estimated_bytes: u64,
+    ) -> DeleteOutcome {
         DeleteOutcome {
             bytes_freed: estimated_bytes,
             outcome: "would delete".to_string(),
@@ -86,7 +101,13 @@ impl<'a> RealEffector<'a> {
 }
 
 impl Effector for RealEffector<'_> {
-    fn delete(&mut self, rule: &Rule, path: &Path, _estimated_bytes: u64) -> DeleteOutcome {
+    fn delete(
+        &mut self,
+        requires_sudo: bool,
+        allowed_prefixes: &[PathBuf],
+        path: &Path,
+        _estimated_bytes: u64,
+    ) -> DeleteOutcome {
         // Re-read /proc/self/mountinfo per candidate rather than caching it
         // once for the batch: mounts can change mid-run, and this is the
         // freshest possible TOCTOU state right before the delete.
@@ -99,19 +120,14 @@ impl Effector for RealEffector<'_> {
                 };
             }
         };
-        let tier = if rule.requires_sudo {
+        let tier = if requires_sudo {
             Tier::System
         } else {
             Tier::User
         };
-        let allowed: Vec<PathBuf> = rule
-            .allowed_prefixes
-            .iter()
-            .map(|p| expand_path_spec(p, self.ctx))
-            .collect();
 
         // Fresh re-check: the world can have changed since scan time (TOCTOU).
-        if let Err(refusal) = validate_deletable(path, &allowed, tier, &env) {
+        if let Err(refusal) = validate_deletable(path, allowed_prefixes, tier, &env) {
             return DeleteOutcome {
                 bytes_freed: 0,
                 outcome: format!("refused: {refusal}"),
@@ -235,6 +251,40 @@ fn append_or_warn(journal: &Journal, record: &Record, summary: &mut Summary) {
     }
 }
 
+/// Runs and journals each of `specs` in turn; shared by `Action::Cmd` and
+/// `Action::CmdSelected` in both `execute` and `execute_selected`.
+#[allow(clippy::too_many_arguments)]
+fn run_specs(
+    specs: Vec<CmdSpec>,
+    rule_id: &str,
+    effector: &mut dyn Effector,
+    journal: &Journal,
+    run_id: &str,
+    dry_run: bool,
+    summary: &mut Summary,
+) {
+    for spec in specs {
+        let outcome = effector.run(&spec);
+        summary.actions += 1;
+        append_or_warn(
+            journal,
+            &Record::now(
+                run_id.to_string(),
+                "clean".to_string(),
+                rule_id.to_string(),
+                "cmd".to_string(),
+                Some(spec.argv.clone()),
+                None,
+                spec.sudo,
+                dry_run,
+                0,
+                outcome.outcome,
+            ),
+            summary,
+        );
+    }
+}
+
 /// Executes every Safe-tier group's selected candidates (or, for
 /// `Action::Cmd` rules, its commands). Moderate/Risky groups are never
 /// auto-executed here — that's what `--yes` acts on non-interactively, and
@@ -268,6 +318,11 @@ pub fn execute(
                 if rule.requires_sudo {
                     continue;
                 }
+                let allowed: Vec<PathBuf> = rule
+                    .allowed_prefixes
+                    .iter()
+                    .map(|p| expand_path_spec(p, ctx))
+                    .collect();
                 for candidate in &group.candidates {
                     if !candidate.selectable {
                         continue;
@@ -275,7 +330,8 @@ pub fn execute(
                     let Some(path) = &candidate.path else {
                         continue;
                     };
-                    let outcome = effector.delete(rule, path, candidate.bytes);
+                    let outcome =
+                        effector.delete(rule.requires_sudo, &allowed, path, candidate.bytes);
                     summary.bytes_freed += outcome.bytes_freed;
                     summary.actions += 1;
                     append_or_warn(
@@ -297,26 +353,35 @@ pub fn execute(
                 }
             }
             Action::Cmd(build_specs) => {
-                for spec in build_specs(ctx, config) {
-                    let outcome = effector.run(&spec);
-                    summary.actions += 1;
-                    append_or_warn(
-                        journal,
-                        &Record::now(
-                            run_id.to_string(),
-                            "clean".to_string(),
-                            rule.id.to_string(),
-                            "cmd".to_string(),
-                            Some(spec.argv.clone()),
-                            None,
-                            spec.sudo,
-                            dry_run,
-                            0,
-                            outcome.outcome,
-                        ),
-                        &mut summary,
-                    );
+                run_specs(
+                    build_specs(ctx, config),
+                    rule.id,
+                    effector,
+                    journal,
+                    run_id,
+                    dry_run,
+                    &mut summary,
+                );
+            }
+            Action::CmdSelected(build_specs) => {
+                let selected: Vec<Candidate> = group
+                    .candidates
+                    .iter()
+                    .filter(|c| c.selectable)
+                    .cloned()
+                    .collect();
+                if selected.is_empty() {
+                    continue;
                 }
+                run_specs(
+                    build_specs(ctx, config, &selected),
+                    rule.id,
+                    effector,
+                    journal,
+                    run_id,
+                    dry_run,
+                    &mut summary,
+                );
             }
         }
     }
@@ -355,6 +420,11 @@ pub fn execute_selected(
 
         match rule.action {
             Action::DeletePaths => {
+                let allowed: Vec<PathBuf> = rule
+                    .allowed_prefixes
+                    .iter()
+                    .map(|p| expand_path_spec(p, ctx))
+                    .collect();
                 for (ci, candidate) in group.candidates.iter().enumerate() {
                     if !selection.contains(&(gi, ci)) {
                         continue;
@@ -364,7 +434,8 @@ pub fn execute_selected(
                     };
 
                     if !rule.requires_sudo {
-                        let outcome = effector.delete(rule, path, candidate.bytes);
+                        let outcome =
+                            effector.delete(rule.requires_sudo, &allowed, path, candidate.bytes);
                         summary.bytes_freed += outcome.bytes_freed;
                         summary.actions += 1;
                         append_or_warn(
@@ -425,26 +496,36 @@ pub fn execute_selected(
                 if !any_selected {
                     continue;
                 }
-                for spec in build_specs(ctx, config) {
-                    let outcome = effector.run(&spec);
-                    summary.actions += 1;
-                    append_or_warn(
-                        journal,
-                        &Record::now(
-                            run_id.to_string(),
-                            "clean".to_string(),
-                            rule.id.to_string(),
-                            "cmd".to_string(),
-                            Some(spec.argv.clone()),
-                            None,
-                            spec.sudo,
-                            dry_run,
-                            0,
-                            outcome.outcome,
-                        ),
-                        &mut summary,
-                    );
+                run_specs(
+                    build_specs(ctx, config),
+                    rule.id,
+                    effector,
+                    journal,
+                    run_id,
+                    dry_run,
+                    &mut summary,
+                );
+            }
+            Action::CmdSelected(build_specs) => {
+                let selected: Vec<Candidate> = group
+                    .candidates
+                    .iter()
+                    .enumerate()
+                    .filter(|(ci, _)| selection.contains(&(gi, *ci)))
+                    .map(|(_, c)| c.clone())
+                    .collect();
+                if selected.is_empty() {
+                    continue;
                 }
+                run_specs(
+                    build_specs(ctx, config, &selected),
+                    rule.id,
+                    effector,
+                    journal,
+                    run_id,
+                    dry_run,
+                    &mut summary,
+                );
             }
         }
     }
@@ -503,6 +584,7 @@ mod tests {
             config: Config::default(),
             sandboxed: true,
             available_commands: None,
+            fake_command_output: None,
         };
         Fixture {
             _sandbox: sandbox,
@@ -1056,5 +1138,168 @@ mod tests {
         let (records, _) = journal.read_all().unwrap();
         assert!(records[0].outcome.contains("skipped"));
         assert!(records[0].sudo);
+    }
+
+    // --- Action::CmdSelected ---
+
+    fn cmd_selected_rule_and_group(id: &'static str) -> (Rule, Group) {
+        fn build_specs(_ctx: &Ctx, _config: &Config, selected: &[Candidate]) -> Vec<CmdSpec> {
+            let mut argv = vec![
+                "pacman".to_string(),
+                "-Rns".to_string(),
+                "--noconfirm".to_string(),
+            ];
+            argv.extend(selected.iter().map(|c| c.label.clone()));
+            vec![CmdSpec {
+                argv,
+                sudo: false,
+                label: "Remove selected orphan packages".to_string(),
+            }]
+        }
+        let rule = Rule {
+            id,
+            title: "test cmd_selected rule",
+            risk: Risk::Moderate,
+            requires_sudo: false,
+            applicable: Applicability::Always,
+            allowed_prefixes: &[],
+            detector: Detector::Globs(&[]),
+            action: Action::CmdSelected(build_specs),
+            notes: "",
+        };
+        let group = Group {
+            rule_id: id.to_string(),
+            title: "test cmd_selected rule".to_string(),
+            risk: Risk::Moderate,
+            requires_sudo: false,
+            candidates: vec![
+                Candidate::new(None, "pkg-a".to_string(), 0, Risk::Moderate),
+                Candidate::new(None, "pkg-b".to_string(), 0, Risk::Moderate),
+            ],
+            skipped: Vec::new(),
+        };
+        (rule, group)
+    }
+
+    #[test]
+    fn test_execute_selected_cmd_selected_builds_command_from_only_the_selected_candidates() {
+        let f = fixture();
+        let (rule, group) = cmd_selected_rule_and_group("test.cmd_selected");
+        let journal = Journal::new(&f.ctx.state_dir);
+        let expected_argv = vec![
+            "pacman".to_string(),
+            "-Rns".to_string(),
+            "--noconfirm".to_string(),
+            "pkg-b".to_string(),
+        ];
+        let fake = FakeRunner::new().with(
+            expected_argv.clone(),
+            CmdOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+        let mut effector = RealEffector::new(&f.ctx, Box::new(fake));
+
+        // Only "pkg-b" (index 1) is selected — "pkg-a" must not appear in argv.
+        let summary = execute_selected(
+            &[group],
+            &HashSet::from([(0usize, 1usize)]),
+            &[rule],
+            &f.ctx,
+            &f.ctx.config.clone(),
+            &mut effector,
+            &journal,
+            "run-1",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(summary.actions, 1);
+        let (records, _) = journal.read_all().unwrap();
+        assert_eq!(records[0].argv, Some(expected_argv));
+        assert_eq!(records[0].outcome, "ok");
+    }
+
+    #[test]
+    fn test_execute_selected_cmd_selected_runs_nothing_when_selection_is_empty() {
+        let f = fixture();
+        let (rule, group) = cmd_selected_rule_and_group("test.cmd_selected_empty");
+        let journal = Journal::new(&f.ctx.state_dir);
+        let mut effector = RealEffector::new(&f.ctx, Box::new(FakeRunner::new()));
+
+        let summary = execute_selected(
+            &[group],
+            &HashSet::new(),
+            &[rule],
+            &f.ctx,
+            &f.ctx.config.clone(),
+            &mut effector,
+            &journal,
+            "run-1",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(summary.actions, 0);
+        let (records, _) = journal.read_all().unwrap();
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn test_execute_selected_cmd_selected_dry_run_prints_exact_argv() {
+        let f = fixture();
+        let (rule, group) = cmd_selected_rule_and_group("test.cmd_selected_dry_run");
+        let journal = Journal::new(&f.ctx.state_dir);
+        let mut effector = DryRunEffector;
+
+        let summary = execute_selected(
+            &[group],
+            &HashSet::from([(0usize, 1usize)]),
+            &[rule],
+            &f.ctx,
+            &f.ctx.config.clone(),
+            &mut effector,
+            &journal,
+            "run-1",
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(summary.actions, 1);
+        let (records, _) = journal.read_all().unwrap();
+        assert_eq!(
+            records[0].outcome,
+            "would run: pacman -Rns --noconfirm pkg-b"
+        );
+        assert!(records[0].dry_run);
+    }
+
+    #[test]
+    fn test_execute_ignores_cmd_selected_when_no_candidate_is_selectable() {
+        let f = fixture();
+        let (rule, mut group) = cmd_selected_rule_and_group("test.cmd_selected_auto");
+        // Moderate candidates default to non-selectable; `execute` (the
+        // Safe-tier `--yes` path) must never run a CmdSelected command built
+        // from an empty selection.
+        assert!(group.candidates.iter().all(|c| !c.selectable));
+        group.risk = Risk::Safe; // force past execute()'s risk gate to isolate this behavior
+        let journal = Journal::new(&f.ctx.state_dir);
+        let mut effector = RealEffector::new(&f.ctx, Box::new(FakeRunner::new()));
+
+        let summary = execute(
+            &[group],
+            &[rule],
+            &f.ctx,
+            &f.ctx.config.clone(),
+            &mut effector,
+            &journal,
+            "run-1",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(summary.actions, 0);
     }
 }

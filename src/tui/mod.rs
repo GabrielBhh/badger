@@ -10,6 +10,7 @@ use ratatui::backend::CrosstermBackend;
 
 pub mod checklist;
 pub mod confirm;
+pub mod picker;
 
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
 

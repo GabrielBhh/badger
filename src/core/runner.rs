@@ -66,9 +66,74 @@ impl CommandRunner for FakeRunner {
     }
 }
 
+/// The runner a command-based detector should use: a `RealRunner` on a real
+/// system, or a `FakeRunner` seeded from `ctx.fake_command_output` while
+/// sandboxed — so detection logic that shells out (pacman orphans, flatpak,
+/// container images, ...) never actually spawns a subprocess in a test.
+pub fn runner_for(ctx: &crate::ctx::Ctx) -> Box<dyn CommandRunner> {
+    if ctx.sandboxed {
+        let mut fake = FakeRunner::new();
+        if let Some(canned) = &ctx.fake_command_output {
+            for (argv, output) in canned {
+                fake = fake.with(argv.clone(), output.clone());
+            }
+        }
+        Box::new(fake)
+    } else {
+        Box::new(RealRunner)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn sandboxed_ctx(
+        fake_command_output: Option<HashMap<Vec<String>, CmdOutput>>,
+    ) -> crate::ctx::Ctx {
+        crate::ctx::Ctx {
+            root: PathBuf::from("/root"),
+            home: PathBuf::from("/root/home/user"),
+            config_dir: PathBuf::new(),
+            state_dir: PathBuf::new(),
+            dry_run: false,
+            debug: false,
+            config: crate::config::Config::default(),
+            sandboxed: true,
+            available_commands: None,
+            fake_command_output,
+        }
+    }
+
+    #[test]
+    fn test_runner_for_sandboxed_returns_canned_output_from_ctx() {
+        let argv = vec!["pacman".to_string(), "-Qtdq".to_string()];
+        let canned = HashMap::from([(
+            argv.clone(),
+            CmdOutput {
+                success: true,
+                stdout: "orphan-pkg\n".to_string(),
+                stderr: String::new(),
+            },
+        )]);
+        let ctx = sandboxed_ctx(Some(canned));
+        let runner = runner_for(&ctx);
+        let out = runner.run(&argv).unwrap();
+        assert_eq!(out.stdout, "orphan-pkg\n");
+    }
+
+    #[test]
+    fn test_runner_for_sandboxed_with_no_canned_output_errors_rather_than_running_for_real() {
+        let ctx = sandboxed_ctx(None);
+        let runner = runner_for(&ctx);
+        assert!(
+            runner
+                .run(&["pacman".to_string(), "-Qtdq".to_string()])
+                .is_err()
+        );
+    }
 
     #[test]
     fn test_real_runner_captures_stdout_and_success() {

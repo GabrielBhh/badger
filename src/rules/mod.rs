@@ -6,6 +6,7 @@ use crate::ctx::Ctx;
 
 pub mod command;
 pub mod dev;
+pub mod moderate;
 pub mod user;
 
 /// Whether a rule even makes sense to run in the current environment.
@@ -15,8 +16,27 @@ pub enum Applicability {
     /// `name` must be found on `PATH` (or in `Ctx::available_commands` when
     /// sandboxed).
     CommandExists(&'static str),
+    /// At least one of these commands must be found (e.g. `podman` or
+    /// `docker`); the rule itself decides which one to prefer.
+    CommandExistsAny(&'static [&'static str]),
     /// `~`-prefixed or root-relative path that must exist.
     PathExists(&'static str),
+}
+
+/// Whether `name` is available: on `PATH` for a real run, or in
+/// `Ctx::available_commands` while sandboxed (tests never touch the real
+/// `PATH`). Shared by `scan::is_applicable` and any detector that needs to
+/// pick between several possible commands (e.g. `podman` vs `docker`).
+pub fn command_exists(name: &str, ctx: &Ctx) -> bool {
+    if ctx.sandboxed {
+        return ctx
+            .available_commands
+            .as_ref()
+            .is_some_and(|cmds| cmds.iter().any(|c| c == name));
+    }
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+        .unwrap_or(false)
 }
 
 /// How a rule finds its candidates.
@@ -44,6 +64,11 @@ pub enum Action {
     /// Run one or more external commands instead of deleting paths
     /// ourselves; the rule's candidates are informational sizing only.
     Cmd(fn(&Ctx, &Config) -> Vec<CmdSpec>),
+    /// Like `Cmd`, but the command is built from exactly the candidates the
+    /// person selected in this group (e.g. `pacman -Rns <ticked packages>`).
+    /// Never invoked with an empty selection — nothing selected means no
+    /// command runs at all.
+    CmdSelected(fn(&Ctx, &Config, &[Candidate]) -> Vec<CmdSpec>),
 }
 
 pub struct Rule {
@@ -89,6 +114,7 @@ pub fn registry() -> Vec<Rule> {
     rules.extend(user::rules());
     rules.extend(dev::rules());
     rules.extend(command::rules());
+    rules.extend(moderate::rules());
     rules
 }
 
@@ -137,6 +163,7 @@ mod tests {
             config: Config::default(),
             sandboxed: true,
             available_commands: None,
+            fake_command_output: None,
         }
     }
 

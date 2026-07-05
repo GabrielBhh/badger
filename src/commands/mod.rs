@@ -5,6 +5,9 @@ use crate::cli::{Cli, Command, WhitelistAction};
 
 pub mod clean;
 pub mod history;
+pub mod purge;
+pub(crate) mod shared;
+pub mod uninstall;
 pub mod whitelist;
 
 pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
@@ -65,7 +68,20 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
         Command::Uninstall => {
-            bail!("`badger uninstall` is not implemented yet — coming in a later phase")
+            let ctx = crate::ctx::Ctx::resolve(
+                cli.dry_run,
+                cli.debug,
+                crate::ctx::EnvOverrides::from_process(),
+            )?;
+            let mode = crate::output::current(cli.json);
+            let output = uninstall::run(&ctx, cli.dry_run, mode)?;
+            // Interactive cancel prints its own "nothing uninstalled" note
+            // to stderr and returns nothing to render — don't add a blank
+            // stdout line on top of it.
+            if !output.rendered.is_empty() {
+                println!("{}", output.rendered);
+            }
+            Ok(())
         }
         Command::Optimize => {
             bail!("`badger optimize` is not implemented yet — coming in a later phase")
@@ -73,8 +89,21 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Status => {
             bail!("`badger status` is not implemented yet — coming in a later phase")
         }
-        Command::Purge => {
-            bail!("`badger purge` is not implemented yet — coming in a later phase")
+        Command::Purge { yes } => {
+            let ctx = crate::ctx::Ctx::resolve(
+                cli.dry_run,
+                cli.debug,
+                crate::ctx::EnvOverrides::from_process(),
+            )?;
+            let mode = crate::output::current(cli.json);
+            let output = purge::run(&ctx, yes, cli.dry_run, mode)?;
+            // Interactive cancel prints its own "nothing purged" note to
+            // stderr and returns nothing to render — don't add a blank
+            // stdout line on top of it.
+            if !output.rendered.is_empty() {
+                println!("{}", output.rendered);
+            }
+            Ok(())
         }
         Command::Analyze { path: _ } => {
             bail!("`badger analyze` is not implemented yet — coming in a later phase")
