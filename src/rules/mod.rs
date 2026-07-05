@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::core::item::{Candidate, Risk};
 use crate::ctx::Ctx;
 
+pub mod command;
 pub mod dev;
 pub mod user;
 
@@ -77,6 +78,7 @@ pub fn registry() -> Vec<Rule> {
     let mut rules = Vec::new();
     rules.extend(user::rules());
     rules.extend(dev::rules());
+    rules.extend(command::rules());
     rules
 }
 
