@@ -125,7 +125,10 @@ fn size_only(raw: Vec<Candidate>) -> Vec<Candidate> {
         .collect()
 }
 
-fn display_label(path: &Path, ctx: &Ctx) -> String {
+/// Renders `path` as a `~/`-relative or root-relative display label. Shared
+/// with `purge::scan`, whose candidates come from a config-driven walk
+/// rather than the static rule registry but want the same display format.
+pub(crate) fn display_label(path: &Path, ctx: &Ctx) -> String {
     if let Ok(rel) = path.strip_prefix(&ctx.home) {
         if rel.as_os_str().is_empty() {
             "~".to_string()

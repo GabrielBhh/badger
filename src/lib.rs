@@ -5,6 +5,7 @@ pub mod core;
 pub mod ctx;
 pub mod output;
 pub mod privilege;
+pub mod purge;
 pub mod rules;
 pub mod safety;
 pub mod tui;
