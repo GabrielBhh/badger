@@ -33,6 +33,7 @@ fn is_applicable(applicable: Applicability, ctx: &Ctx) -> bool {
             names.iter().any(|name| command_exists(name, ctx))
         }
         Applicability::PathExists(spec) => expand_path_spec(spec, ctx).exists(),
+        Applicability::Fn(f) => f(ctx),
     }
 }
 

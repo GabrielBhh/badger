@@ -7,6 +7,7 @@ use crate::ctx::Ctx;
 pub mod command;
 pub mod dev;
 pub mod moderate;
+pub mod optimize;
 pub mod user;
 
 /// Whether a rule even makes sense to run in the current environment.
@@ -21,6 +22,11 @@ pub enum Applicability {
     CommandExistsAny(&'static [&'static str]),
     /// `~`-prefixed or root-relative path that must exist.
     PathExists(&'static str),
+    /// Escape hatch for applicability that depends on more than "is this one
+    /// command on PATH" — e.g. picking between several tools *and* honoring a
+    /// config override (`optimize.mirrors`'s `mirror_tool` setting). `Ctx`
+    /// carries `config`, so this covers both without a new parameter.
+    Fn(fn(&Ctx) -> bool),
 }
 
 /// Whether `name` is available: on `PATH` for a real run, or in
