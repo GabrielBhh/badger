@@ -7,4 +7,5 @@ pub mod output;
 pub mod privilege;
 pub mod rules;
 pub mod safety;
+pub mod tui;
 pub mod util;
