@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::ctx::Ctx;
 use crate::safety::protected::unescape_octal;
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct DiskTotals {
     pub total: u64,
     pub used: u64,
