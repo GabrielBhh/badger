@@ -3,6 +3,7 @@ use clap::CommandFactory;
 
 use crate::cli::{Cli, Command, WhitelistAction};
 
+pub mod analyze;
 pub mod clean;
 pub mod history;
 pub mod purge;
@@ -105,8 +106,20 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Analyze { path: _ } => {
-            bail!("`badger analyze` is not implemented yet — coming in a later phase")
+        Command::Analyze { path } => {
+            let ctx = crate::ctx::Ctx::resolve(
+                cli.dry_run,
+                cli.debug,
+                crate::ctx::EnvOverrides::from_process(),
+            )?;
+            let mode = crate::output::current(cli.json);
+            let output = analyze::run(&ctx, path, mode)?;
+            // The interactive explorer renders nothing when the session
+            // made no deletions — don't print a blank stdout line then.
+            if !output.rendered.is_empty() {
+                println!("{}", output.rendered);
+            }
+            Ok(())
         }
     }
 }

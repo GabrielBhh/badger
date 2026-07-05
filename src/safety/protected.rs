@@ -192,7 +192,7 @@ pub fn parse_mountinfo(text: &str) -> HashSet<PathBuf> {
 }
 
 /// mountinfo escapes space, tab, newline, and backslash as \NNN octal.
-fn unescape_octal(s: &str) -> String {
+pub(crate) fn unescape_octal(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

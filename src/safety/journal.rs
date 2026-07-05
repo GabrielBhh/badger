@@ -62,6 +62,14 @@ impl Journal {
         }
     }
 
+    /// Appends `record`; a failed audit-trail write must not fail the
+    /// caller's action, so it's reported to stderr instead of propagated.
+    pub fn append_or_warn(&self, record: &Record) {
+        if let Err(e) = self.append(record) {
+            eprintln!("warning: failed to record audit trail: {e:#}");
+        }
+    }
+
     pub fn append(&self, r: &Record) -> anyhow::Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
