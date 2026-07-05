@@ -21,6 +21,7 @@ use crate::output::{Mode, humanize_bytes};
 use crate::purge;
 use crate::rules::expand_path_spec;
 use crate::safety::journal::{Journal, Record};
+use crate::safety::whitelist::Whitelist;
 use crate::tui;
 
 pub struct PurgeOutput {
@@ -41,7 +42,8 @@ pub fn run(ctx: &Ctx, yes: bool, dry_run_flag: bool, mode: Mode) -> anyhow::Resu
         return run_interactive(ctx, dry_run_flag);
     }
 
-    let groups = purge::scan(ctx, &ctx.config)?;
+    let whitelist = Whitelist::load(&ctx.config_dir, &ctx.home)?;
+    let groups = purge::scan(ctx, &ctx.config, &whitelist)?;
 
     // --dry-run always wins over --yes: never risk a real delete on a preview request.
     let will_execute = yes || dry_run_flag;
@@ -105,7 +107,8 @@ pub fn run(ctx: &Ctx, yes: bool, dry_run_flag: bool, mode: Mode) -> anyhow::Resu
 /// Interactive `badger purge`: scan, show the checklist and confirmation,
 /// then delete exactly what was selected.
 fn run_interactive(ctx: &Ctx, dry_run_flag: bool) -> anyhow::Result<PurgeOutput> {
-    let groups = purge::scan(ctx, &ctx.config)?;
+    let whitelist = Whitelist::load(&ctx.config_dir, &ctx.home)?;
+    let groups = purge::scan(ctx, &ctx.config, &whitelist)?;
 
     if !groups
         .iter()
@@ -376,6 +379,10 @@ mod tests {
         node_modules
     }
 
+    fn empty_whitelist() -> Whitelist {
+        crate::safety::whitelist::parse("", std::path::Path::new("/home/user")).unwrap()
+    }
+
     #[test]
     fn test_default_plan_shows_candidate_and_does_not_touch_journal_or_filesystem() {
         let f = fixture();
@@ -420,6 +427,28 @@ mod tests {
     }
 
     #[test]
+    // Bug: purge's --yes path never consulted the user's
+    // ~/.config/badger/whitelist, so a path explicitly marked "never touch
+    // this" was deleted anyway. Root cause: purge::scan built candidates
+    // directly, skipping the whitelist check core/scan.rs's
+    // finish_deletable_candidates applies for `badger clean`.
+    fn test_whitelisted_artifact_is_never_deleted_by_yes() {
+        let f = fixture();
+        let dir = project_with_node_modules(&f.ctx, "site");
+        std::fs::create_dir_all(&f.ctx.config_dir).unwrap();
+        std::fs::write(
+            f.ctx.config_dir.join("whitelist"),
+            "~/dev/site/node_modules\n",
+        )
+        .unwrap();
+
+        let output = run(&f.ctx, true, false, Mode::Human).unwrap();
+
+        assert!(output.rendered.contains("Freed 0 B"));
+        assert!(dir.exists(), "whitelisted artifact must survive --yes");
+    }
+
+    #[test]
     fn test_recent_project_is_never_deleted_by_yes() {
         let f = fixture();
         let project = f.ctx.home.join("dev/freshsite");
@@ -459,7 +488,7 @@ mod tests {
     fn test_render_after_selection_executes_only_the_selected_candidate() {
         let f = fixture();
         let dir = project_with_node_modules(&f.ctx, "site");
-        let groups = purge::scan(&f.ctx, &f.ctx.config.clone()).unwrap();
+        let groups = purge::scan(&f.ctx, &f.ctx.config.clone(), &empty_whitelist()).unwrap();
         let journal = Journal::new(&f.ctx.state_dir);
         let selection = HashSet::from([(0usize, 0usize)]);
 

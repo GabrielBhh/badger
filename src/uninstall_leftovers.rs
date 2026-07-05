@@ -14,6 +14,7 @@ use crate::core::scan::display_label;
 use crate::ctx::Ctx;
 use crate::pkg::Backend;
 use crate::safety::protected::{SafetyEnv, Tier, validate_deletable};
+use crate::safety::whitelist::Whitelist;
 use crate::util::dirsize::dir_size;
 
 /// The locations this scan ever looks under — also the `validate_deletable`
@@ -31,8 +32,17 @@ pub fn allowed_prefixes(ctx: &Ctx) -> Vec<PathBuf> {
 /// Scans for leftovers of a just-removed package. `name` is the package's
 /// display name (used for the per-app directories and glob prefixes); `id`
 /// is its backend identifier (used only for flatpak's `~/.var/app/<id>`,
-/// since that directory is keyed by app ID, not name).
-pub fn scan(ctx: &Ctx, name: &str, id: &str, backend: Backend) -> anyhow::Result<Group> {
+/// since that directory is keyed by app ID, not name). `whitelist` is the
+/// user's `~/.config/badger/whitelist` — a match marks the candidate
+/// whitelisted (permanently unselectable in the checklist) exactly like
+/// `core::scan`'s rule-registry scan does.
+pub fn scan(
+    ctx: &Ctx,
+    name: &str,
+    id: &str,
+    backend: Backend,
+    whitelist: &Whitelist,
+) -> anyhow::Result<Group> {
     let env = SafetyEnv::from_system(ctx)?;
     let allowed = allowed_prefixes(ctx);
 
@@ -76,7 +86,12 @@ pub fn scan(ctx: &Ctx, name: &str, id: &str, backend: Backend) -> anyhow::Result
         }
         let bytes = dir_size(&path);
         let label = display_label(&path, ctx);
-        candidates.push(Candidate::new(Some(path), label, bytes, Risk::Moderate));
+        let mut candidate = Candidate::new(Some(path.clone()), label, bytes, Risk::Moderate);
+        if whitelist.matches(&path) {
+            candidate.whitelisted = true;
+            candidate.selectable = false;
+        }
+        candidates.push(candidate);
     }
 
     Ok(Group {
@@ -178,6 +193,10 @@ mod tests {
         }
     }
 
+    fn empty_whitelist() -> Whitelist {
+        crate::safety::whitelist::parse("", Path::new("/home/user")).unwrap()
+    }
+
     #[test]
     fn test_finds_config_local_share_and_cache_dirs_by_exact_name() {
         let f = fixture();
@@ -186,7 +205,7 @@ mod tests {
         std::fs::create_dir_all(f.ctx.home.join(".cache/foo")).unwrap();
         std::fs::write(f.ctx.home.join(".cache/foo/data.bin"), vec![0u8; 4096]).unwrap();
 
-        let group = scan(&f.ctx, "foo", "foo", Backend::Pacman).unwrap();
+        let group = scan(&f.ctx, "foo", "foo", Backend::Pacman, &empty_whitelist()).unwrap();
         let mut labels: Vec<_> = group.candidates.iter().map(|c| c.label.clone()).collect();
         labels.sort();
         assert_eq!(
@@ -217,7 +236,14 @@ mod tests {
         let f = fixture();
         std::fs::create_dir_all(f.ctx.home.join(".config/firefoxx")).unwrap();
 
-        let group = scan(&f.ctx, "firefox", "firefox", Backend::Pacman).unwrap();
+        let group = scan(
+            &f.ctx,
+            "firefox",
+            "firefox",
+            Backend::Pacman,
+            &empty_whitelist(),
+        )
+        .unwrap();
         assert!(group.candidates.is_empty());
     }
 
@@ -226,7 +252,14 @@ mod tests {
         let f = fixture();
         std::fs::create_dir_all(f.ctx.home.join(".config/foo-app")).unwrap();
 
-        let group = scan(&f.ctx, "Foo-App", "Foo-App", Backend::Pacman).unwrap();
+        let group = scan(
+            &f.ctx,
+            "Foo-App",
+            "Foo-App",
+            Backend::Pacman,
+            &empty_whitelist(),
+        )
+        .unwrap();
         assert_eq!(group.candidates.len(), 1);
         assert_eq!(group.candidates[0].label, "~/.config/foo-app");
     }
@@ -236,7 +269,14 @@ mod tests {
         let f = fixture();
         std::fs::create_dir_all(f.ctx.home.join(".var/app/org.foo.App")).unwrap();
 
-        let group = scan(&f.ctx, "Foo App", "org.foo.App", Backend::Flatpak).unwrap();
+        let group = scan(
+            &f.ctx,
+            "Foo App",
+            "org.foo.App",
+            Backend::Flatpak,
+            &empty_whitelist(),
+        )
+        .unwrap();
         assert!(
             group
                 .candidates
@@ -250,7 +290,7 @@ mod tests {
         let f = fixture();
         std::fs::create_dir_all(f.ctx.home.join(".var/app/foo")).unwrap();
 
-        let group = scan(&f.ctx, "foo", "foo", Backend::Pacman).unwrap();
+        let group = scan(&f.ctx, "foo", "foo", Backend::Pacman, &empty_whitelist()).unwrap();
         assert!(group.candidates.is_empty());
     }
 
@@ -269,7 +309,7 @@ mod tests {
         )
         .unwrap();
 
-        let group = scan(&f.ctx, "foo", "foo", Backend::Pacman).unwrap();
+        let group = scan(&f.ctx, "foo", "foo", Backend::Pacman, &empty_whitelist()).unwrap();
         assert_eq!(group.candidates.len(), 1);
         assert_eq!(
             group.candidates[0].label,
@@ -293,7 +333,7 @@ mod tests {
         )
         .unwrap();
 
-        let group = scan(&f.ctx, "foo", "foo", Backend::Pacman).unwrap();
+        let group = scan(&f.ctx, "foo", "foo", Backend::Pacman, &empty_whitelist()).unwrap();
         let mut labels: Vec<_> = group.candidates.iter().map(|c| c.label.clone()).collect();
         labels.sort();
         assert_eq!(
@@ -308,7 +348,14 @@ mod tests {
     #[test]
     fn test_no_leftovers_yields_empty_group() {
         let f = fixture();
-        let group = scan(&f.ctx, "nothing-here", "nothing-here", Backend::Pacman).unwrap();
+        let group = scan(
+            &f.ctx,
+            "nothing-here",
+            "nothing-here",
+            Backend::Pacman,
+            &empty_whitelist(),
+        )
+        .unwrap();
         assert!(group.candidates.is_empty());
         assert!(group.skipped.is_empty());
         assert_eq!(group.risk, Risk::Moderate);
@@ -330,7 +377,7 @@ mod tests {
         )
         .unwrap();
 
-        let group = scan(&f.ctx, "git", "git", Backend::Pacman).unwrap();
+        let group = scan(&f.ctx, "git", "git", Backend::Pacman, &empty_whitelist()).unwrap();
         assert!(group.candidates.is_empty());
     }
 
@@ -350,7 +397,7 @@ mod tests {
         )
         .unwrap();
 
-        let group = scan(&f.ctx, "code", "code", Backend::Pacman).unwrap();
+        let group = scan(&f.ctx, "code", "code", Backend::Pacman, &empty_whitelist()).unwrap();
         assert!(group.candidates.is_empty());
     }
 
@@ -362,9 +409,34 @@ mod tests {
         // never have it silently offered as a deletable leftover.
         std::fs::create_dir_all(f.ctx.home.join(".config/badger")).unwrap();
 
-        let group = scan(&f.ctx, "badger", "badger", Backend::Pacman).unwrap();
+        let group = scan(
+            &f.ctx,
+            "badger",
+            "badger",
+            Backend::Pacman,
+            &empty_whitelist(),
+        )
+        .unwrap();
         assert!(group.candidates.is_empty());
         assert_eq!(group.skipped.len(), 1);
         assert_eq!(group.skipped[0].0, "~/.config/badger");
+    }
+
+    #[test]
+    // Bug: uninstall_leftovers::scan never consulted the user's whitelist,
+    // so a whitelisted leftover directory was left toggleable in the
+    // checklist like any other Moderate candidate. Root cause: only
+    // core/scan.rs's finish_deletable_candidates applied the whitelist;
+    // this scan built candidates on its own and skipped that step.
+    fn test_whitelisted_leftover_is_marked_whitelisted_and_unselectable() {
+        let f = fixture();
+        std::fs::create_dir_all(f.ctx.home.join(".config/foo")).unwrap();
+
+        let wl = crate::safety::whitelist::parse("~/.config/foo", &f.ctx.home).unwrap();
+        let group = scan(&f.ctx, "foo", "foo", Backend::Pacman, &wl).unwrap();
+
+        assert_eq!(group.candidates.len(), 1);
+        assert!(group.candidates[0].whitelisted);
+        assert!(!group.candidates[0].selectable);
     }
 }

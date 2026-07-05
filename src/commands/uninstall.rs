@@ -19,6 +19,7 @@ use crate::output::{Mode, humanize_bytes};
 use crate::pkg::{Backend, InstalledPackage};
 use crate::rules::CmdSpec;
 use crate::safety::journal::{Journal, Record};
+use crate::safety::whitelist::Whitelist;
 use crate::tui::{self, confirm, picker};
 use crate::uninstall_leftovers;
 
@@ -88,8 +89,9 @@ fn run_interactive(ctx: &Ctx, dry_run_flag: bool) -> anyhow::Result<UninstallOut
 
     let journal = Journal::new(&ctx.state_dir);
     let run_id = jiff::Timestamp::now().to_string();
+    let whitelist = Whitelist::load(&ctx.config_dir, &ctx.home)?;
     let leftover_group =
-        uninstall_leftovers::scan(ctx, &package.name, &package.id, package.backend)?;
+        uninstall_leftovers::scan(ctx, &package.name, &package.id, package.backend, &whitelist)?;
 
     let show_checklist =
         !leftover_group.candidates.is_empty() || !leftover_group.skipped.is_empty();
@@ -386,6 +388,10 @@ mod tests {
         }
     }
 
+    fn empty_whitelist() -> Whitelist {
+        crate::safety::whitelist::parse("", std::path::Path::new("/home/user")).unwrap()
+    }
+
     fn flatpak_package() -> InstalledPackage {
         InstalledPackage {
             backend: Backend::Flatpak,
@@ -498,8 +504,14 @@ mod tests {
         );
         let mut effector = RealEffector::new(&f.ctx, Box::new(fake));
 
-        let leftover_group =
-            uninstall_leftovers::scan(&f.ctx, &package.name, &package.id, package.backend).unwrap();
+        let leftover_group = uninstall_leftovers::scan(
+            &f.ctx,
+            &package.name,
+            &package.id,
+            package.backend,
+            &empty_whitelist(),
+        )
+        .unwrap();
         assert_eq!(
             leftover_group.candidates.len(),
             1,
@@ -539,8 +551,14 @@ mod tests {
         let journal = Journal::new(&f.ctx.state_dir);
         let mut effector = DryRunEffector;
 
-        let leftover_group =
-            uninstall_leftovers::scan(&f.ctx, &package.name, &package.id, package.backend).unwrap();
+        let leftover_group = uninstall_leftovers::scan(
+            &f.ctx,
+            &package.name,
+            &package.id,
+            package.backend,
+            &empty_whitelist(),
+        )
+        .unwrap();
         let selection = HashSet::from([(0usize, 0usize)]);
 
         let output = render_after_removal_and_leftovers(
@@ -595,8 +613,14 @@ mod tests {
         );
         let mut effector = RealEffector::new(&f.ctx, Box::new(fake));
 
-        let leftover_group =
-            uninstall_leftovers::scan(&f.ctx, &package.name, &package.id, package.backend).unwrap();
+        let leftover_group = uninstall_leftovers::scan(
+            &f.ctx,
+            &package.name,
+            &package.id,
+            package.backend,
+            &empty_whitelist(),
+        )
+        .unwrap();
         assert_eq!(leftover_group.candidates.len(), 2);
         // Only select whichever candidate sorts first (~/.cache/Foo App).
         let selection = HashSet::from([(0usize, 0usize)]);
@@ -729,5 +753,33 @@ mod tests {
         assert!(output.rendered.contains("skipped"));
         let (records, _) = journal.read_all().unwrap();
         assert_eq!(records[0].paths, Some(vec!["/usr/bin/foo".to_string()]));
+    }
+
+    #[test]
+    // Bug: uninstall_leftovers::scan never consulted the user's whitelist, so
+    // a whitelisted leftover could still be manually checked in the TUI
+    // checklist and deleted, defeating the whitelist's "never touch this"
+    // contract. Root cause: nothing threaded a loaded Whitelist into the scan.
+    fn test_whitelisted_leftover_cannot_be_selected_via_the_checklist() {
+        let f = fixture();
+        let package = pacman_package();
+        std::fs::create_dir_all(f.ctx.home.join(".config/foo")).unwrap();
+        let wl = crate::safety::whitelist::parse("~/.config/foo", &f.ctx.home).unwrap();
+
+        let leftover_group =
+            uninstall_leftovers::scan(&f.ctx, &package.name, &package.id, package.backend, &wl)
+                .unwrap();
+        assert_eq!(
+            leftover_group.candidates.len(),
+            1,
+            "sanity: a leftover exists"
+        );
+
+        let mut state = crate::tui::checklist::ChecklistState::new(vec![leftover_group]);
+        state.toggle();
+        assert!(
+            !state.is_selected(0, 0),
+            "a whitelisted leftover must never become selectable"
+        );
     }
 }

@@ -15,6 +15,7 @@ use crate::core::scan::display_label;
 use crate::ctx::Ctx;
 use crate::rules::expand_path_spec;
 use crate::safety::protected::{SafetyEnv, Tier, validate_deletable};
+use crate::safety::whitelist::Whitelist;
 use crate::util::dirsize::dir_size;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,7 +77,9 @@ impl ArtifactKind {
 /// `Group` per artifact kind (always all nine, even if empty — same
 /// convention `rules::registry()`'s groups follow). Missing roots are
 /// skipped silently; the caller logs them under `--debug` if it wants to.
-pub fn scan(ctx: &Ctx, config: &Config) -> anyhow::Result<Vec<Group>> {
+/// `whitelist` is the user's `~/.config/badger/whitelist` — a match greys the
+/// candidate out exactly like `core::scan`'s rule-registry scan does.
+pub fn scan(ctx: &Ctx, config: &Config, whitelist: &Whitelist) -> anyhow::Result<Vec<Group>> {
     let env = SafetyEnv::from_system(ctx)?;
     let allowed: Vec<PathBuf> = config
         .purge
@@ -119,6 +122,10 @@ pub fn scan(ctx: &Ctx, config: &Config) -> anyhow::Result<Vec<Group>> {
         let bytes = dir_size(&path);
         let mut label = display_label(&path, ctx);
         let mut candidate = Candidate::new(Some(path.clone()), label.clone(), bytes, Risk::Safe);
+        if whitelist.matches(&path) {
+            candidate.whitelisted = true;
+            candidate.selectable = false;
+        }
         if is_recent(&path, cutoff) {
             candidate.selectable = false;
             label.push_str(" (recent)");
@@ -253,6 +260,10 @@ mod tests {
         groups.iter().find(|g| g.rule_id == rule_id).unwrap()
     }
 
+    fn empty_whitelist() -> Whitelist {
+        crate::safety::whitelist::parse("", Path::new("/home/user")).unwrap()
+    }
+
     fn touch(path: &Path) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, b"").unwrap();
@@ -279,7 +290,7 @@ mod tests {
         std::fs::create_dir_all(project.join("node_modules/left-pad")).unwrap();
         age(&project);
 
-        let groups = scan(&f.ctx, &f.ctx.config.clone()).unwrap();
+        let groups = scan(&f.ctx, &f.ctx.config.clone(), &empty_whitelist()).unwrap();
         let g = group(&groups, "purge.node_modules");
         assert_eq!(g.candidates.len(), 1);
         assert_eq!(g.candidates[0].label, "~/dev/site/node_modules");
@@ -291,7 +302,7 @@ mod tests {
         // A "target" dir with no Cargo.toml next to it — must not be picked up.
         std::fs::create_dir_all(f.ctx.home.join("dev/random/target")).unwrap();
 
-        let groups = scan(&f.ctx, &f.ctx.config.clone()).unwrap();
+        let groups = scan(&f.ctx, &f.ctx.config.clone(), &empty_whitelist()).unwrap();
         assert!(group(&groups, "purge.cargo_target").candidates.is_empty());
     }
 
@@ -303,7 +314,7 @@ mod tests {
         std::fs::create_dir_all(project.join("target/debug")).unwrap();
         age(&project);
 
-        let groups = scan(&f.ctx, &f.ctx.config.clone()).unwrap();
+        let groups = scan(&f.ctx, &f.ctx.config.clone(), &empty_whitelist()).unwrap();
         let g = group(&groups, "purge.cargo_target");
         assert_eq!(g.candidates.len(), 1);
         assert_eq!(g.candidates[0].label, "~/dev/rustapp/target");
@@ -318,7 +329,7 @@ mod tests {
         std::fs::create_dir_all(project.join("other_venv_lookalike")).unwrap();
         age(&project);
 
-        let groups = scan(&f.ctx, &f.ctx.config.clone()).unwrap();
+        let groups = scan(&f.ctx, &f.ctx.config.clone(), &empty_whitelist()).unwrap();
         let g = group(&groups, "purge.py_venv");
         assert_eq!(g.candidates.len(), 1);
         assert_eq!(g.candidates[0].label, "~/dev/pyapp/.venv");
@@ -340,7 +351,7 @@ mod tests {
         let ungated = f.ctx.home.join("dev/random-dir");
         std::fs::create_dir_all(ungated.join("dist")).unwrap();
 
-        let groups = scan(&f.ctx, &f.ctx.config.clone()).unwrap();
+        let groups = scan(&f.ctx, &f.ctx.config.clone(), &empty_whitelist()).unwrap();
         let g = group(&groups, "purge.dist_build");
         let mut labels: Vec<_> = g.candidates.iter().map(|c| c.label.clone()).collect();
         labels.sort();
@@ -360,7 +371,7 @@ mod tests {
         touch(&project.join("package.json"));
         std::fs::create_dir_all(project.join(".next")).unwrap();
 
-        let groups = scan(&f.ctx, &f.ctx.config.clone()).unwrap();
+        let groups = scan(&f.ctx, &f.ctx.config.clone(), &empty_whitelist()).unwrap();
         assert_eq!(group(&groups, "purge.next_build").candidates.len(), 1);
     }
 
@@ -370,7 +381,7 @@ mod tests {
         std::fs::create_dir_all(f.ctx.home.join("dev/a/b/__pycache__")).unwrap();
         std::fs::create_dir_all(f.ctx.home.join("dev/__pycache__")).unwrap();
 
-        let groups = scan(&f.ctx, &f.ctx.config.clone()).unwrap();
+        let groups = scan(&f.ctx, &f.ctx.config.clone(), &empty_whitelist()).unwrap();
         assert_eq!(group(&groups, "purge.pycache").candidates.len(), 2);
     }
 
@@ -385,7 +396,7 @@ mod tests {
         let no_gradle_file = f.ctx.home.join("dev/notgradle");
         std::fs::create_dir_all(no_gradle_file.join(".gradle")).unwrap();
 
-        let groups = scan(&f.ctx, &f.ctx.config.clone()).unwrap();
+        let groups = scan(&f.ctx, &f.ctx.config.clone(), &empty_whitelist()).unwrap();
         let g = group(&groups, "purge.gradle");
         assert_eq!(g.candidates.len(), 1);
         assert_eq!(g.candidates[0].label, "~/dev/gradleapp/.gradle");
@@ -397,7 +408,7 @@ mod tests {
         std::fs::create_dir_all(f.ctx.home.join("dev/pyapp/.mypy_cache")).unwrap();
         std::fs::create_dir_all(f.ctx.home.join("dev/pyapp/.pytest_cache")).unwrap();
 
-        let groups = scan(&f.ctx, &f.ctx.config.clone()).unwrap();
+        let groups = scan(&f.ctx, &f.ctx.config.clone(), &empty_whitelist()).unwrap();
         assert_eq!(group(&groups, "purge.mypy_cache").candidates.len(), 1);
         assert_eq!(group(&groups, "purge.pytest_cache").candidates.len(), 1);
     }
@@ -410,7 +421,7 @@ mod tests {
         // A nested node_modules-inside-node_modules must not be counted separately.
         std::fs::create_dir_all(project.join("node_modules/some-pkg/node_modules/inner")).unwrap();
 
-        let groups = scan(&f.ctx, &f.ctx.config.clone()).unwrap();
+        let groups = scan(&f.ctx, &f.ctx.config.clone(), &empty_whitelist()).unwrap();
         assert_eq!(group(&groups, "purge.node_modules").candidates.len(), 1);
     }
 
@@ -422,7 +433,7 @@ mod tests {
         std::fs::create_dir_all(project.join("node_modules")).unwrap();
         // Default mtime (just created) is "now" — well within recent_days.
 
-        let groups = scan(&f.ctx, &f.ctx.config.clone()).unwrap();
+        let groups = scan(&f.ctx, &f.ctx.config.clone(), &empty_whitelist()).unwrap();
         let g = group(&groups, "purge.node_modules");
         assert_eq!(g.candidates.len(), 1);
         assert!(g.candidates[0].label.ends_with("(recent)"));
@@ -440,7 +451,7 @@ mod tests {
         std::fs::create_dir_all(project.join("node_modules")).unwrap();
         age(&project);
 
-        let groups = scan(&f.ctx, &f.ctx.config.clone()).unwrap();
+        let groups = scan(&f.ctx, &f.ctx.config.clone(), &empty_whitelist()).unwrap();
         let g = group(&groups, "purge.node_modules");
         assert_eq!(g.candidates.len(), 1);
         assert!(!g.candidates[0].label.contains("(recent)"));
@@ -458,7 +469,7 @@ mod tests {
         std::fs::create_dir_all(project.join("node_modules")).unwrap();
         std::fs::write(project.join("node_modules/big.bin"), vec![0u8; 8192]).unwrap();
 
-        let groups = scan(&f.ctx, &f.ctx.config.clone()).unwrap();
+        let groups = scan(&f.ctx, &f.ctx.config.clone(), &empty_whitelist()).unwrap();
         let g = group(&groups, "purge.node_modules");
         assert!(g.candidates[0].bytes > 0);
     }
@@ -467,7 +478,7 @@ mod tests {
     fn test_missing_root_yields_empty_groups_without_error() {
         let f = fixture();
         // ~/dev was never created.
-        let groups = scan(&f.ctx, &f.ctx.config.clone()).unwrap();
+        let groups = scan(&f.ctx, &f.ctx.config.clone(), &empty_whitelist()).unwrap();
         assert_eq!(groups.len(), 9);
         assert!(groups.iter().all(|g| g.candidates.is_empty()));
     }
@@ -482,9 +493,32 @@ mod tests {
         touch(&ctx.home.join("package.json"));
         std::fs::create_dir_all(ctx.home.join("node_modules")).unwrap();
 
-        let groups = scan(&ctx, &ctx.config.clone()).unwrap();
+        let groups = scan(&ctx, &ctx.config.clone(), &empty_whitelist()).unwrap();
         let g = group(&groups, "purge.node_modules");
         assert!(g.candidates.is_empty());
         assert_eq!(g.skipped.len(), 1);
+    }
+
+    #[test]
+    // Bug: purge::scan never consulted the user's whitelist, so a
+    // whitelisted artifact was offered as a normal, pre-checked deletable
+    // candidate — the opposite of the whitelist's "never touch this"
+    // contract. Root cause: finish_deletable_candidates in core/scan.rs
+    // applies the whitelist, but purge::scan built candidates on its own and
+    // skipped that step entirely.
+    fn test_whitelisted_artifact_is_greyed_out_and_unselectable() {
+        let f = fixture();
+        let project = f.ctx.home.join("dev/site");
+        touch(&project.join("package.json"));
+        std::fs::create_dir_all(project.join("node_modules")).unwrap();
+        age(&project);
+
+        let wl = crate::safety::whitelist::parse("~/dev/site/node_modules", &f.ctx.home).unwrap();
+        let groups = scan(&f.ctx, &f.ctx.config.clone(), &wl).unwrap();
+        let g = group(&groups, "purge.node_modules");
+
+        assert_eq!(g.candidates.len(), 1);
+        assert!(g.candidates[0].whitelisted);
+        assert!(!g.candidates[0].selectable);
     }
 }
