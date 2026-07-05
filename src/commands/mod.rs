@@ -8,6 +8,7 @@ pub mod clean;
 pub mod history;
 pub mod purge;
 pub(crate) mod shared;
+pub mod status;
 pub mod uninstall;
 pub mod whitelist;
 
@@ -88,7 +89,15 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
             bail!("`badger optimize` is not implemented yet — coming in a later phase")
         }
         Command::Status => {
-            bail!("`badger status` is not implemented yet — coming in a later phase")
+            let ctx = crate::ctx::Ctx::resolve(
+                cli.dry_run,
+                cli.debug,
+                crate::ctx::EnvOverrides::from_process(),
+            )?;
+            let mode = crate::output::current(cli.json);
+            let output = status::run(&ctx, mode)?;
+            println!("{}", output.rendered);
+            Ok(())
         }
         Command::Purge { yes } => {
             let ctx = crate::ctx::Ctx::resolve(

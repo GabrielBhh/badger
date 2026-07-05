@@ -81,7 +81,7 @@ pub fn read_diskstats(ctx: &Ctx) -> anyhow::Result<DiskSample> {
 }
 
 /// Bytes/sec read and written for one device over the sampled interval.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct DeviceRate {
     pub name: String,
     pub read_bytes_per_sec: f64,

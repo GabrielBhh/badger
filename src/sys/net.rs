@@ -52,7 +52,7 @@ pub fn read_net_dev(ctx: &Ctx) -> anyhow::Result<NetSample> {
 }
 
 /// Bytes/sec rx/tx rate for one interface.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct IfaceRate {
     pub name: String,
     pub rx_bytes_per_sec: f64,

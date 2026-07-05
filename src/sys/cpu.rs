@@ -121,7 +121,7 @@ pub fn cpu_percent(prev: &CpuSample, curr: &CpuSample) -> Vec<f64> {
 }
 
 /// One-minute/five-minute/fifteen-minute load averages from `/proc/loadavg`.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
 pub struct LoadAvg {
     pub one: f64,
     pub five: f64,
