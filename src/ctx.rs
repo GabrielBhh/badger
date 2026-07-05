@@ -35,6 +35,10 @@ pub struct Ctx {
     pub debug: bool,
     pub config: Config,
     pub sandboxed: bool,
+    /// Test-only override for which commands `Applicability::CommandExists`
+    /// should treat as present. Only consulted while `sandboxed`; populated
+    /// from the comma-separated `BADGER_COMMANDS` env var.
+    pub available_commands: Option<Vec<String>>,
 }
 
 impl Ctx {
@@ -79,6 +83,14 @@ impl Ctx {
 
         let config = config::load(&config_dir)?;
 
+        let available_commands = if sandboxed {
+            std::env::var("BADGER_COMMANDS")
+                .ok()
+                .map(|v| v.split(',').map(str::to_string).collect())
+        } else {
+            None
+        };
+
         Ok(Ctx {
             root,
             home,
@@ -88,6 +100,7 @@ impl Ctx {
             debug,
             config,
             sandboxed,
+            available_commands,
         })
     }
 }
