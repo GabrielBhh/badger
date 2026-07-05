@@ -293,14 +293,6 @@ fn analyze_record(
     )
 }
 
-/// Writes a record to the journal; a failed audit-trail write must not fail
-/// the delete it describes (matches `analyze::trash`'s convention).
-fn journal_or_warn(ctx: &Ctx, record: &Record) {
-    if let Err(e) = Journal::new(&ctx.state_dir).append(record) {
-        eprintln!("warning: failed to record audit trail: {e:#}");
-    }
-}
-
 /// The real delete seam behind the explorer's `d` key: trash via the
 /// engine's `trash_path` (which validates and journals itself), and — for
 /// cross-filesystem sources only — a validated, journaled permanent delete
@@ -341,13 +333,15 @@ impl explorer::AnalyzeEffector for RealAnalyzeEffector<'_> {
         if let Err(refusal) =
             validate_deletable(path, std::slice::from_ref(&self.start), Tier::User, &env)
         {
-            journal_or_warn(self.ctx, &record(0, format!("refused: {refusal}")));
+            Journal::new(&self.ctx.state_dir)
+                .append_or_warn(&record(0, format!("refused: {refusal}")));
             return Err(format!("refused: {refusal}"));
         }
 
         let report = delete_tree(path);
         if report.errors.is_empty() {
-            journal_or_warn(self.ctx, &record(report.bytes_freed, "ok".to_string()));
+            Journal::new(&self.ctx.state_dir)
+                .append_or_warn(&record(report.bytes_freed, "ok".to_string()));
             Ok(report.bytes_freed)
         } else {
             let detail = report
@@ -356,10 +350,8 @@ impl explorer::AnalyzeEffector for RealAnalyzeEffector<'_> {
                 .map(|(p, e)| format!("{}: {e}", p.display()))
                 .collect::<Vec<_>>()
                 .join("; ");
-            journal_or_warn(
-                self.ctx,
-                &record(report.bytes_freed, format!("error: {detail}")),
-            );
+            Journal::new(&self.ctx.state_dir)
+                .append_or_warn(&record(report.bytes_freed, format!("error: {detail}")));
             Err(detail)
         }
     }
@@ -389,11 +381,12 @@ impl DryRunAnalyzeEffector<'_> {
         if let Err(refusal) =
             validate_deletable(path, std::slice::from_ref(&self.start), Tier::User, &env)
         {
-            journal_or_warn(self.ctx, &record(0, format!("refused: {refusal}")));
+            Journal::new(&self.ctx.state_dir)
+                .append_or_warn(&record(0, format!("refused: {refusal}")));
             return Err(format!("refused: {refusal}"));
         }
         let bytes = crate::util::dirsize::dir_size(path);
-        journal_or_warn(self.ctx, &record(bytes, would.to_string()));
+        Journal::new(&self.ctx.state_dir).append_or_warn(&record(bytes, would.to_string()));
         Ok(bytes)
     }
 }

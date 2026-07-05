@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 /// One directory in a recursive size scan. `bytes`/`files` are always full
 /// recursive totals, even for a node whose `children` have been pruned by
 /// `max_depth` — only the tree shape is truncated, never the numbers.
+/// Hardlinked files are counted once per link encountered (like `du
+/// --count-links`), not deduplicated by inode.
 #[derive(Debug, serde::Serialize)]
 pub struct DirNode {
     pub path: PathBuf,
@@ -383,6 +385,9 @@ pub fn scan(
         handles.push(std::thread::spawn(move || -> Vec<DirNode> {
             let mut results = Vec::new();
             loop {
+                if shared.cancel.load(Ordering::Relaxed) {
+                    break;
+                }
                 let Some((path, name)) = lock(&queue).pop_front() else {
                     break;
                 };

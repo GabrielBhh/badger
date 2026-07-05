@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -786,6 +786,9 @@ pub enum Action {
 }
 
 pub fn map_key(key: KeyEvent) -> Option<Action> {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Some(Action::Quit);
+    }
     match key.code {
         KeyCode::Char('j') | KeyCode::Down => Some(Action::Down),
         KeyCode::Char('k') | KeyCode::Up => Some(Action::Up),
@@ -942,7 +945,6 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &ExplorerState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -1255,6 +1257,14 @@ mod tests {
         assert_eq!(map_key(key(KeyCode::Char('q'))), Some(Action::Quit));
         assert_eq!(map_key(key(KeyCode::Esc)), Some(Action::Quit));
         assert_eq!(map_key(key(KeyCode::Char('z'))), None);
+    }
+
+    #[test]
+    fn test_map_key_ctrl_c_quits() {
+        // Raw mode swallows SIGINT, so Ctrl-C must map to the same quit
+        // action as q/esc.
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(map_key(ctrl_c), Some(Action::Quit));
     }
 
     // --- rendering ---

@@ -87,15 +87,6 @@ fn claim_info_file(
     }
 }
 
-/// Writes a record to the journal; a failed audit-trail write must not fail
-/// the caller's action, so it's reported to stderr instead (matches
-/// `core::exec`'s "audit trail must not abort" convention).
-fn journal_or_warn(ctx: &Ctx, record: &Record) {
-    if let Err(e) = Journal::new(&ctx.state_dir).append(record) {
-        eprintln!("warning: failed to record audit trail: {e:#}");
-    }
-}
-
 /// Moves `path` into the freedesktop trash under `ctx.home`, after passing
 /// the same safety validation the executor applies before a real delete.
 /// `start` is the directory the current analyze session was started on — the
@@ -123,7 +114,7 @@ pub fn trash_path(
 
     let env = SafetyEnv::from_system(ctx)?;
     if let Err(refusal) = validate_deletable(path, &[start.to_path_buf()], Tier::User, &env) {
-        journal_or_warn(ctx, &record(0, format!("refused: {refusal}")));
+        Journal::new(&ctx.state_dir).append_or_warn(&record(0, format!("refused: {refusal}")));
         bail!("refused: {refusal}");
     }
 
@@ -149,10 +140,10 @@ pub fn trash_path(
         .with_context(|| format!("failed to stat {}", files_dir.display()))?
         .dev();
     if !same_device(source_dev, trash_dev) {
-        journal_or_warn(
-            ctx,
-            &record(0, "refused: can't trash across filesystems".to_string()),
-        );
+        Journal::new(&ctx.state_dir).append_or_warn(&record(
+            0,
+            "refused: can't trash across filesystems".to_string(),
+        ));
         return Err(CrossFilesystem.into());
     }
 
@@ -196,7 +187,7 @@ pub fn trash_path(
         return Err(e);
     }
 
-    journal_or_warn(ctx, &record(bytes, "ok".to_string()));
+    Journal::new(&ctx.state_dir).append_or_warn(&record(bytes, "ok".to_string()));
 
     Ok(TrashOutcome {
         trashed_to: target,
