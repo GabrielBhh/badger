@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 /// One directory in a recursive size scan. `bytes`/`files` are always full
 /// recursive totals, even for a node whose `children` have been pruned by
 /// `max_depth` — only the tree shape is truncated, never the numbers.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct DirNode {
     pub path: PathBuf,
     pub name: String,
@@ -40,7 +40,7 @@ impl Default for ScanOptions {
 }
 
 /// One of the N largest files seen anywhere in a scanned tree.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct LargeFile {
     pub path: PathBuf,
     pub bytes: u64,
