@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  # Full test suite as a release gate — a tag on a red tree must not ship.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: Build release binary (musl, stripped via release profile)
+        run: cross build --release --locked --target ${{ matrix.target }}
+      - name: Build native binary to generate completions and man pages
+        # The aarch64 binary can't run on the x86_64 runner, so completions
+        # and man pages come from a native build of the same commit.
+        run: cargo build --release --locked
+      - name: Assemble tarball
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGE="badger-$VERSION-${{ matrix.target }}"
+          mkdir -p "$STAGE/completions" "$STAGE/man"
+          cp "target/${{ matrix.target }}/release/badger" "$STAGE/badger"
+          cp LICENSE README.md "$STAGE/"
+          ./target/release/badger completion bash > "$STAGE/completions/badger.bash"
+          ./target/release/badger completion zsh > "$STAGE/completions/_badger"
+          ./target/release/badger completion fish > "$STAGE/completions/badger.fish"
+          ./target/release/badger __mangen "$STAGE/man"
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+          sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarball-${{ matrix.target }}
+          path: |
+            badger-*.tar.gz
+            badger-*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Create draft release
+        # draft: true — nothing goes public until a human clicks Publish.
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: |
+            badger-*.tar.gz
+            badger-*.tar.gz.sha256
