@@ -348,6 +348,7 @@ fn drive_picker(
             Some(picker::Action::Type(c)) => state.push_char(c),
             Some(picker::Action::Backspace) => state.backspace(),
             Some(picker::Action::ToggleView) => state.toggle_view(),
+            Some(picker::Action::ToggleRecommended) => state.toggle_recommended_only(),
             Some(picker::Action::Cancel) => return Ok(None),
             Some(picker::Action::Select) => {
                 if let Some(package) = state.selected() {

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -5,6 +7,8 @@ use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
 use crate::output::humanize_bytes;
+use crate::pkg::desktop::Category;
+use crate::pkg::recommend::{self, Kind};
 use crate::pkg::{AppEntry, Backend, InstalledPackage};
 
 /// Which row source the picker is currently showing.
@@ -21,6 +25,9 @@ pub enum View {
 pub struct PickerRow<'a> {
     pub display_name: &'a str,
     pub package: &'a InstalledPackage,
+    /// Index into the picker's own `items`/packages — the key
+    /// `PickerState::recommendations_for` looks badges up by.
+    pub package_index: usize,
 }
 
 /// Pure state for `badger uninstall`'s package picker: a single-select list
@@ -41,6 +48,13 @@ pub struct PickerState {
     cursor: usize,
     /// First row index of `filtered` currently drawn at the body's top.
     scroll: usize,
+    /// Advisory hints keyed by package index (see `pkg::recommend`) — empty
+    /// until `set_recommendations` is called. Display-only: never affects
+    /// `selected()`.
+    recommendations: HashMap<usize, Vec<Kind>>,
+    /// `r`-toggled "recommended only" filter, narrowing and re-sorting the
+    /// Apps view on top of the text filter.
+    recommended_only: bool,
 }
 
 impl PickerState {
@@ -61,9 +75,26 @@ impl PickerState {
             filtered: Vec::new(),
             cursor: 0,
             scroll: 0,
+            recommendations: HashMap::new(),
+            recommended_only: false,
         };
         state.recompute_filter();
         state
+    }
+
+    /// Installs the advisory recommendations for the Applications view,
+    /// keyed by package index — called once after a scan, before the picker
+    /// is first drawn. Re-derives the filter since `recommended_only` may
+    /// already be (harmlessly) set with nothing yet to narrow to.
+    pub fn set_recommendations(&mut self, recommendations: Vec<recommend::Recommendation>) {
+        self.recommendations = HashMap::new();
+        for r in recommendations {
+            self.recommendations
+                .entry(r.package_index)
+                .or_default()
+                .push(r.kind);
+        }
+        self.recompute_filter();
     }
 
     /// Like `new`, but starts in the Packages view even when apps exist
@@ -119,6 +150,7 @@ impl PickerState {
                 .map(|&i| PickerRow {
                     display_name: self.apps[i].display_name.as_str(),
                     package: &self.items[self.apps[i].package_index],
+                    package_index: self.apps[i].package_index,
                 })
                 .collect(),
             View::Packages => self
@@ -127,9 +159,42 @@ impl PickerState {
                 .map(|&i| PickerRow {
                     display_name: self.items[i].name.as_str(),
                     package: &self.items[i],
+                    package_index: i,
                 })
                 .collect(),
         }
+    }
+
+    /// Every recommendation for `package_index`, or an empty slice if it has
+    /// none — display-only, consulted by `render` for the Apps view's badge
+    /// suffixes.
+    pub fn recommendations_for(&self, package_index: usize) -> &[Kind] {
+        self.recommendations
+            .get(&package_index)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Whether at least one app carries a recommendation at all — the
+    /// footer's `r: recommended` hint (Apps view only) is conditional on
+    /// this.
+    pub fn has_any_recommendation(&self) -> bool {
+        !self.recommendations.is_empty()
+    }
+
+    pub fn recommended_only(&self) -> bool {
+        self.recommended_only
+    }
+
+    /// Toggles the "recommended only" filter and re-derives `filtered`. A
+    /// no-op outside the Apps view (Packages rows never carry badges, so
+    /// there is nothing meaningful to narrow to there).
+    pub fn toggle_recommended_only(&mut self) {
+        if self.view != View::Apps {
+            return;
+        }
+        self.recommended_only = !self.recommended_only;
+        self.recompute_filter();
     }
 
     pub fn cursor(&self) -> usize {
@@ -166,15 +231,25 @@ impl PickerState {
     fn recompute_filter(&mut self) {
         let needle = self.filter.to_lowercase();
         self.filtered = match self.view {
-            View::Apps => self
-                .apps
-                .iter()
-                .enumerate()
-                .filter(|(_, a)| {
-                    needle.is_empty() || a.display_name.to_lowercase().contains(&needle)
-                })
-                .map(|(i, _)| i)
-                .collect(),
+            View::Apps => {
+                let mut idxs: Vec<usize> = self
+                    .apps
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| {
+                        needle.is_empty() || a.display_name.to_lowercase().contains(&needle)
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                if self.recommended_only {
+                    idxs.retain(|&i| {
+                        self.recommendations
+                            .contains_key(&self.apps[i].package_index)
+                    });
+                    idxs.sort_by_key(|&i| self.recommendation_sort_key(self.apps[i].package_index));
+                }
+                idxs
+            }
             View::Packages => self
                 .items
                 .iter()
@@ -189,6 +264,25 @@ impl PickerState {
         };
         self.cursor = 0;
         self.scroll = 0;
+    }
+
+    /// Sort key for the recommended-only Apps view: duplicates first, then
+    /// unused (oldest — largest `months` — first), then overlaps. A stable
+    /// sort keeps ties in their prior (alphabetical) order. Normal-view
+    /// alphabetical order is untouched — this is only ever consulted when
+    /// `recommended_only` is set.
+    fn recommendation_sort_key(&self, package_index: usize) -> (u8, i64) {
+        let kinds = self.recommendations_for(package_index);
+        if kinds.iter().any(|k| matches!(k, Kind::Duplicate { .. })) {
+            return (0, 0);
+        }
+        if let Some(months) = kinds.iter().find_map(|k| match k {
+            Kind::Unused { months } => Some(*months),
+            _ => None,
+        }) {
+            return (1, -i64::from(months));
+        }
+        (2, 0)
     }
 
     pub fn move_down(&mut self) {
@@ -236,8 +330,15 @@ pub enum Action {
     Select,
     Cancel,
     ToggleView,
+    ToggleRecommended,
 }
 
+/// Plain `r` (no modifier) is reserved for `ToggleRecommended` rather than
+/// falling through to `Type('r')` — a deliberate trade-off matching the
+/// issue's request for a bare `r` key: typing a filter that contains a
+/// lowercase `r` (e.g. "firefox") will toggle the recommended-only view
+/// instead of adding the letter. Nothing else in the picker reserves a
+/// plain letter this way.
 pub fn map_key(key: KeyEvent) -> Option<Action> {
     match key.code {
         KeyCode::Down => Some(Action::Down),
@@ -248,6 +349,7 @@ pub fn map_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Esc => Some(Action::Cancel),
         KeyCode::Backspace => Some(Action::Backspace),
         KeyCode::Tab => Some(Action::ToggleView),
+        KeyCode::Char('r') if key.modifiers.is_empty() => Some(Action::ToggleRecommended),
         KeyCode::Char(c) => Some(Action::Type(c)),
         _ => None,
     }
@@ -293,13 +395,21 @@ pub fn render(frame: &mut Frame, state: &PickerState, colors: bool) {
     ];
     frame.render_widget(Paragraph::new(header), chunks[0]);
 
+    let show_badges = state.view() == View::Apps;
     let body: Vec<Line> = state
         .visible()
         .iter()
         .enumerate()
         .skip(state.scroll_offset())
         .take(chunks[1].height as usize)
-        .map(|(i, row)| render_row(row, i == state.cursor()))
+        .map(|(i, row)| {
+            let recommendations = if show_badges {
+                state.recommendations_for(row.package_index)
+            } else {
+                &[]
+            };
+            render_row(row, i == state.cursor(), recommendations)
+        })
         .collect();
     frame.render_widget(Paragraph::new(body), chunks[1]);
 
@@ -311,21 +421,56 @@ pub fn render(frame: &mut Frame, state: &PickerState, colors: bool) {
             View::Packages => "  tab: applications",
         });
     }
+    if state.view() == View::Apps && state.has_any_recommendation() {
+        footer_text.push_str("  r: recommended");
+    }
     frame.render_widget(Paragraph::new(vec![Line::from(footer_text)]), chunks[2]);
 }
 
-fn render_row(row: &PickerRow, is_cursor: bool) -> Line<'static> {
+fn render_row(row: &PickerRow, is_cursor: bool, recommendations: &[Kind]) -> Line<'static> {
     let marker = if is_cursor { ">" } else { " " };
     let size = match row.package.size_bytes {
         Some(bytes) => format!("  {}", humanize_bytes(bytes)),
         None => String::new(),
     };
+    let hints: String = recommendations
+        .iter()
+        .map(|k| format!("  {}", recommendation_text(k)))
+        .collect();
     Line::from(format!(
-        "{marker} {} {} [{}]{size}",
+        "{marker} {} {} [{}]{size}{hints}",
         row.display_name,
         row.package.version,
         badge(row.package)
     ))
+}
+
+/// The advisory suffix text for one recommendation kind, e.g. `dup w/
+/// flatpak`, `unused ~6mo`, `1 of 4 browsers` — always a plain-language
+/// guess, never phrased as a directive.
+fn recommendation_text(kind: &Kind) -> String {
+    match kind {
+        Kind::Duplicate { other_backend } => format!("dup w/ {}", other_backend.label()),
+        Kind::Unused { months } => format!("unused ~{months}mo"),
+        Kind::Overlap { category, count } => format!("1 of {count} {}", category_word(*category)),
+    }
+}
+
+/// Plain-language word for a `.desktop` main category, used in the `1 of N
+/// <word>` overlap badge.
+fn category_word(category: Category) -> &'static str {
+    match category {
+        Category::WebBrowser => "browsers",
+        Category::Email => "email clients",
+        Category::AudioVideo | Category::Video => "video players",
+        Category::Audio => "audio players",
+        Category::TextEditor => "text editors",
+        Category::IDE => "IDEs",
+        Category::FileManager => "file managers",
+        Category::TerminalEmulator => "terminals",
+        Category::Graphics => "graphics apps",
+        Category::Game => "games",
+    }
 }
 
 #[cfg(test)]
@@ -497,6 +642,14 @@ mod tests {
     #[test]
     fn test_map_key_tab_is_toggle_view() {
         assert_eq!(map_key(key(KeyCode::Tab)), Some(Action::ToggleView));
+    }
+
+    #[test]
+    fn test_map_key_plain_r_is_toggle_recommended() {
+        assert_eq!(
+            map_key(key(KeyCode::Char('r'))),
+            Some(Action::ToggleRecommended)
+        );
     }
 
     // --- apps view / toggle ---
@@ -845,5 +998,238 @@ mod tests {
             text.contains("PWNED"),
             "leading printable prefix must still show"
         );
+    }
+
+    // --- recommendations / `r` toggle ---
+
+    fn recommendation_fixture() -> (Vec<InstalledPackage>, Vec<AppEntry>) {
+        // package_index: 0 firefox(pacman) 1 firefox(flatpak, dup of 0)
+        // 2 oldapp(unused) 3 chromium(overlap) 4 brave(overlap) 5 plainapp(none)
+        let items = vec![
+            package("firefox", "121.0", Backend::Pacman, false),
+            InstalledPackage {
+                id: "org.mozilla.firefox".to_string(),
+                ..package("Firefox", "121.0", Backend::Flatpak, false)
+            },
+            package("oldapp", "1.0", Backend::Pacman, false),
+            package("chromium", "1.0", Backend::Pacman, false),
+            package("brave", "1.0", Backend::Pacman, false),
+            package("plainapp", "1.0", Backend::Pacman, false),
+        ];
+        // Alphabetical by display name, as pkg::applications produces.
+        let apps = vec![
+            app_entry("Brave", 4),
+            app_entry("Chromium", 3),
+            app_entry("Firefox", 0),
+            app_entry("Firefox", 1),
+            app_entry("OldApp", 2),
+            app_entry("PlainApp", 5),
+        ];
+        (items, apps)
+    }
+
+    fn app_entry(display_name: &str, package_index: usize) -> AppEntry {
+        AppEntry {
+            display_name: display_name.to_string(),
+            package_index,
+        }
+    }
+
+    fn recommendation_fixture_recs() -> Vec<recommend::Recommendation> {
+        vec![
+            recommend::Recommendation {
+                package_index: 0,
+                kind: Kind::Duplicate {
+                    other_backend: Backend::Flatpak,
+                },
+            },
+            recommend::Recommendation {
+                package_index: 1,
+                kind: Kind::Duplicate {
+                    other_backend: Backend::Pacman,
+                },
+            },
+            recommend::Recommendation {
+                package_index: 2,
+                kind: Kind::Unused { months: 6 },
+            },
+            recommend::Recommendation {
+                package_index: 3,
+                kind: Kind::Overlap {
+                    category: Category::WebBrowser,
+                    count: 3,
+                },
+            },
+            recommend::Recommendation {
+                package_index: 4,
+                kind: Kind::Overlap {
+                    category: Category::WebBrowser,
+                    count: 3,
+                },
+            },
+        ]
+    }
+
+    fn visible_ids(state: &PickerState) -> Vec<String> {
+        state
+            .visible()
+            .iter()
+            .map(|r| r.package.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn test_has_any_recommendation_is_false_until_set() {
+        let (items, apps) = recommendation_fixture();
+        let mut state = PickerState::new(items, apps);
+        assert!(!state.has_any_recommendation());
+        state.set_recommendations(recommendation_fixture_recs());
+        assert!(state.has_any_recommendation());
+    }
+
+    #[test]
+    fn test_toggle_recommended_only_narrows_to_only_flagged_apps() {
+        let (items, apps) = recommendation_fixture();
+        let mut state = PickerState::new(items, apps);
+        state.set_recommendations(recommendation_fixture_recs());
+
+        assert!(!state.recommended_only());
+        state.toggle_recommended_only();
+        assert!(state.recommended_only());
+        assert_eq!(
+            visible_ids(&state),
+            vec![
+                "firefox",
+                "org.mozilla.firefox",
+                "oldapp",
+                "brave",
+                "chromium"
+            ],
+            "duplicates first, then unused (oldest first), then overlaps"
+        );
+        state.toggle_recommended_only();
+        assert!(!state.recommended_only());
+    }
+
+    #[test]
+    fn test_normal_view_alphabetical_order_is_unaffected_by_recommendations() {
+        let (items, apps) = recommendation_fixture();
+        let mut state = PickerState::new(items, apps);
+        state.set_recommendations(recommendation_fixture_recs());
+
+        assert_eq!(
+            state
+                .visible()
+                .iter()
+                .map(|r| r.display_name.to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "Brave", "Chromium", "Firefox", "Firefox", "OldApp", "PlainApp"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_recommended_only_combines_with_the_text_filter() {
+        let (items, apps) = recommendation_fixture();
+        let mut state = PickerState::new(items, apps);
+        state.set_recommendations(recommendation_fixture_recs());
+        state.toggle_recommended_only();
+
+        for c in "old".chars() {
+            state.push_char(c);
+        }
+        assert_eq!(visible_ids(&state), vec!["oldapp"]);
+
+        state.backspace();
+        state.backspace();
+        state.backspace();
+        for c in "plain".chars() {
+            state.push_char(c);
+        }
+        assert!(
+            visible_ids(&state).is_empty(),
+            "plainapp matches the text filter but carries no recommendation"
+        );
+    }
+
+    #[test]
+    fn test_toggle_recommended_only_resets_cursor_and_scroll() {
+        let (items, apps) = recommendation_fixture();
+        let mut state = PickerState::new(items, apps);
+        state.set_recommendations(recommendation_fixture_recs());
+        state.move_down();
+        state.move_down();
+        assert_eq!(state.cursor(), 2);
+
+        state.toggle_recommended_only();
+        assert_eq!(state.cursor(), 0);
+        assert_eq!(state.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn test_toggle_recommended_only_is_a_no_op_in_packages_view() {
+        let (items, apps) = recommendation_fixture();
+        let mut state = PickerState::new(items, apps);
+        state.set_recommendations(recommendation_fixture_recs());
+        state.toggle_view();
+        assert_eq!(state.view(), View::Packages);
+
+        state.toggle_recommended_only();
+        assert!(!state.recommended_only());
+        assert_eq!(state.visible().len(), 6, "all packages still shown");
+    }
+
+    #[test]
+    fn test_render_shows_recommendation_badges_in_apps_view() {
+        let (items, apps) = recommendation_fixture();
+        let mut state = PickerState::new(items, apps);
+        state.set_recommendations(recommendation_fixture_recs());
+
+        let text = full_text(&draw(&state));
+        assert!(text.contains("Firefox 121.0 [pacman]  dup w/ flatpak"));
+        assert!(text.contains("OldApp 1.0 [pacman]  unused ~6mo"));
+        assert!(text.contains("Chromium 1.0 [pacman]  1 of 3 browsers"));
+        let plain_row = text.lines().find(|l| l.contains("PlainApp")).unwrap();
+        assert!(
+            plain_row.trim_end().ends_with("[pacman]"),
+            "an app with no recommendation gets no badge suffix"
+        );
+    }
+
+    #[test]
+    fn test_render_hint_shown_only_in_apps_view_and_only_when_a_recommendation_exists() {
+        // Wide enough that the footer's combined "tab: ..." + "r: ..." hints
+        // aren't clipped (unlike most tests here, `draw`'s default 100 cols
+        // isn't quite enough once both hints are present).
+        let (items, apps) = recommendation_fixture();
+        let mut state = PickerState::new(items.clone(), apps.clone());
+        assert!(
+            !full_text(&draw_sized(&state, 140, 24)).contains("r: recommended"),
+            "no recommendations set yet"
+        );
+
+        state.set_recommendations(recommendation_fixture_recs());
+        assert!(full_text(&draw_sized(&state, 140, 24)).contains("r: recommended"));
+
+        state.toggle_view();
+        assert!(
+            !full_text(&draw_sized(&state, 140, 24)).contains("r: recommended"),
+            "hint is Apps-view only"
+        );
+    }
+
+    #[test]
+    fn test_render_packages_view_never_shows_badges() {
+        let (items, apps) = recommendation_fixture();
+        let mut state = PickerState::new(items, apps);
+        state.set_recommendations(recommendation_fixture_recs());
+        state.toggle_view();
+        assert_eq!(state.view(), View::Packages);
+
+        let text = full_text(&draw(&state));
+        assert!(!text.contains("dup w/"));
+        assert!(!text.contains("unused ~"));
+        assert!(!text.contains(" browsers"));
     }
 }
