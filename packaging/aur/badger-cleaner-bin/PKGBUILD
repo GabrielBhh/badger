@@ -1,0 +1,42 @@
+# Maintainer: Gabriel <gabriel.bh@gmail.com>
+pkgname=badger-cleaner-bin
+pkgver=0.9.0
+pkgrel=1
+pkgdesc="A Mole-inspired system cleaner for CachyOS/Arch Linux (prebuilt binary)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/GabrielBhh/badger"
+license=('MIT')
+# Static musl build — no runtime library dependencies.
+depends=()
+provides=('badger-cleaner')
+conflicts=('badger-cleaner')
+optdepends=(
+  'pacman-contrib: paccache support for package-cache cleanup'
+  'flatpak: flatpak cache/unused-app cleanup'
+  'snapper: btrfs snapshot cleanup'
+  'podman: container prune support'
+  'docker: container prune support'
+  'plocate: updatedb optimize task'
+  'reflector: mirror-ranking optimize task'
+)
+source_x86_64=("https://github.com/GabrielBhh/badger/releases/download/v$pkgver/badger-$pkgver-x86_64-unknown-linux-musl.tar.gz")
+source_aarch64=("https://github.com/GabrielBhh/badger/releases/download/v$pkgver/badger-$pkgver-aarch64-unknown-linux-musl.tar.gz")
+# Placeholders — no release has been published yet. Fill these with the real
+# checksums from the release's .sha256 files (or `updpkgsums`) before this
+# package is ever submitted to the AUR.
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+  cd "badger-$pkgver-$CARCH-unknown-linux-musl"
+
+  install -Dm755 badger "$pkgdir/usr/bin/badger"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+  install -Dm644 completions/badger.bash "$pkgdir/usr/share/bash-completion/completions/badger"
+  install -Dm644 completions/_badger "$pkgdir/usr/share/zsh/site-functions/_badger"
+  install -Dm644 completions/badger.fish "$pkgdir/usr/share/fish/vendor_completions.d/badger.fish"
+
+  install -d "$pkgdir/usr/share/man/man1"
+  install -m644 man/*.1 "$pkgdir/usr/share/man/man1/"
+}

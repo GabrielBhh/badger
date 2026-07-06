@@ -7,6 +7,12 @@ use clap::{Parser, Subcommand};
     name = "badger",
     version,
     about = "Clean, uninstall, analyze, optimize, and monitor your Arch system from the terminal",
+    long_about = "A safety-first system cleaner for CachyOS and other Arch-based distros. \
+badger finds reclaimable disk space, unused packages, and stale system state, \
+shows exactly what it found, and touches nothing until you confirm — dry-run \
+planning, a whitelist, risk tiers, trash-first deletion, and a full history \
+journal are built in.",
+    after_help = "docs: docs/RULES.md, https://github.com/GabrielBhh/badger",
     subcommand_required = true,
     arg_required_else_help = true
 )]
@@ -79,6 +85,8 @@ pub enum Command {
     Completion { shell: clap_complete::Shell },
     #[command(name = "__helper", hide = true)]
     Helper,
+    #[command(name = "__mangen", hide = true)]
+    Mangen { dir: std::path::PathBuf },
 }
 
 #[derive(Subcommand, Debug)]

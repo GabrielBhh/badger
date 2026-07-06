@@ -152,3 +152,24 @@ A top-level directory becomes a candidate only if **all five** of these hold:
 
 Only top-level directories are ever scanned — files, symlinks, and anything
 nested inside a top-level directory are never candidates on their own.
+
+## Release checklist
+
+Everything below is prepared in the repo but deliberately unpublished. First
+public release, in order:
+
+1. **VM-verify the snapper booted-snapshot exclusion** (btrfs + snapper +
+   limine or grub-btrfs): boot into a snapshot and confirm badger never
+   offers the booted snapshot (or snapshot 0 / the default) for deletion.
+   This is the pre-ship gate — nothing else happens until it passes.
+2. Bump the version to 1.0.0 in `Cargo.toml` (and `pkgver` in both
+   PKGBUILDs), commit via the normal issue/PR flow.
+3. Tag `v1.0.0` and push the tag — `release.yml` runs the tests, builds the
+   musl tarballs, and creates a **draft** GitHub release.
+4. Inspect the draft's artifacts, then publish it (un-draft) by hand.
+5. In `packaging/aur/*/PKGBUILD`, replace the `SKIP` checksums with real
+   ones (`updpkgsums` against the published tag/release), then regenerate
+   both `.SRCINFO`s with `makepkg --printsrcinfo > .SRCINFO`.
+6. Push `badger-cleaner` and `badger-cleaner-bin` to their AUR git remotes.
+7. Sanity-check `packaging/install.sh` against the live release on a clean
+   machine or container.
