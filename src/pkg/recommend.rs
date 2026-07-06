@@ -37,8 +37,18 @@ pub enum Kind {
     /// Its cache/config directories haven't been touched in roughly this
     /// many months.
     Unused { months: u32 },
-    /// One of `count` installed apps sharing `category`.
-    Overlap { category: Category, count: usize },
+    /// One of `count` installed apps sharing `category`. `most_used` marks
+    /// the group member with the freshest activity signal (see
+    /// `activity_ages_days`) — recency of the app's own cache/config files,
+    /// not launch counts, so it's an honest proxy rather than a measurement.
+    /// If no member of the group has any matching cache/config directory at
+    /// all, nobody is marked. Ties are broken by first occurrence in the
+    /// caller's `apps` order.
+    Overlap {
+        category: Category,
+        count: usize,
+        most_used: bool,
+    },
 }
 
 /// Builds every recommendation for `apps`, each keyed back to its package via
@@ -53,7 +63,7 @@ pub fn recommendations(
 ) -> Vec<Recommendation> {
     let mut out = duplicates(apps, packages);
     out.extend(unused(apps, packages, ctx, config));
-    out.extend(overlaps(apps, desktop_apps));
+    out.extend(overlaps(apps, packages, desktop_apps, ctx));
     out
 }
 
@@ -130,11 +140,11 @@ fn age_days(modified: SystemTime) -> Option<f64> {
         .map(|d| d.as_secs_f64() / 86_400.0)
 }
 
-/// For each app, the same name-variant logic `uninstall_leftovers::scan`
-/// uses finds `~/.cache/<name>` and `~/.config/<name>` (only those two — not
-/// the full leftover scan's systemd/autostart globs). At least one must
-/// exist, and every one that exists must be at least `config.uninstall.unused_days`
-/// old, before this offers a guess at all.
+/// The mtime ages (in days) of whichever of `~/.cache/<name>`/`~/.config/<name>`
+/// exist for `package`, using the same name-variant logic
+/// `uninstall_leftovers::scan` uses (only those two dirs — not the full
+/// leftover scan's systemd/autostart globs). Empty if none exist — the
+/// shared probe `unused()` and `overlaps()`'s most-used marker both build on.
 ///
 /// Heuristic, not proof — a directory's mtime is a coarse signal:
 /// - A top-level dir's mtime only changes when an entry is added or removed
@@ -143,9 +153,31 @@ fn age_days(modified: SystemTime) -> Option<f64> {
 ///   still look untouched here.
 /// - A symlinked cache/config dir reports the *link's* mtime, not the target's
 ///   — a long-lived symlink pointing at actively-used data can still look old.
+fn activity_ages_days(package: &InstalledPackage, ctx: &Ctx) -> Vec<f64> {
+    let variants = crate::uninstall_leftovers::name_variants(&package.name);
+    let mut ages = Vec::new();
+    for variant in &variants {
+        for base in [".cache", ".config"] {
+            let path = ctx.home.join(base).join(variant);
+            if let Ok(meta) = std::fs::symlink_metadata(&path)
+                && let Ok(modified) = meta.modified()
+                && let Some(age) = age_days(modified)
+            {
+                ages.push(age);
+            }
+        }
+    }
+    ages
+}
+
+/// At least one of `activity_ages_days` must exist, and every one that exists
+/// must be at least `config.uninstall.unused_days` old, before this offers a
+/// guess at all. Absence of evidence (no matching dirs) is never treated as
+/// evidence of non-use.
 ///
-/// Both can produce a false "unused" guess, which is why this is advisory
-/// only and never auto-selects anything.
+/// Both false-positive modes documented on `activity_ages_days` can produce a
+/// false "unused" guess, which is why this is advisory only and never
+/// auto-selects anything.
 fn unused(
     apps: &[AppEntry],
     packages: &[InstalledPackage],
@@ -156,19 +188,7 @@ fn unused(
     let mut out = Vec::new();
     for app in apps {
         let package = &packages[app.package_index];
-        let variants = crate::uninstall_leftovers::name_variants(&package.name);
-        let mut ages = Vec::new();
-        for variant in &variants {
-            for base in [".cache", ".config"] {
-                let path = ctx.home.join(base).join(variant);
-                if let Ok(meta) = std::fs::symlink_metadata(&path)
-                    && let Ok(modified) = meta.modified()
-                    && let Some(age) = age_days(modified)
-                {
-                    ages.push(age);
-                }
-            }
-        }
+        let ages = activity_ages_days(package, ctx);
         if ages.is_empty() {
             continue; // no evidence either way — never guess "unused"
         }
@@ -191,7 +211,17 @@ fn unused(
 /// Three or more apps sharing the same `.desktop` main category (matched to
 /// each `AppEntry` by its display name, the same string `pkg::applications`
 /// chose from among that package's `.desktop` entries) each get `Overlap`.
-fn overlaps(apps: &[AppEntry], desktop_apps: &[DesktopApp]) -> Vec<Recommendation> {
+/// Within each such group, the member with the freshest `activity_ages_days`
+/// (smallest minimum age) is marked `most_used`; a tie keeps whichever member
+/// was found first while iterating `apps` in the caller's own order — an
+/// arbitrary but deterministic pick, not a claim that it's truly the busier
+/// app.
+fn overlaps(
+    apps: &[AppEntry],
+    packages: &[InstalledPackage],
+    desktop_apps: &[DesktopApp],
+    ctx: &Ctx,
+) -> Vec<Recommendation> {
     // Sorted by desktop_file first, matching `pkg::applications`' convention,
     // so that when two entries share a display name but disagree on
     // category, the first one in path order deterministically wins rather
@@ -218,9 +248,37 @@ fn overlaps(apps: &[AppEntry], desktop_apps: &[DesktopApp]) -> Vec<Recommendatio
         *counts.entry(*cat).or_insert(0) += 1;
     }
 
+    // For each category that will actually get an `Overlap` badge, find the
+    // freshest member (see doc comment above for the tie rule). `best_age`
+    // and `most_used_index` are only ever set together, one entry per
+    // category.
+    let mut best_age: HashMap<Category, f64> = HashMap::new();
+    let mut most_used_index: HashMap<Category, usize> = HashMap::new();
+    for (i, cat) in categories.iter().enumerate() {
+        let Some(cat) = cat else { continue };
+        match counts.get(cat) {
+            Some(&count) if count >= 3 => {}
+            _ => continue,
+        }
+        let ages = activity_ages_days(&packages[apps[i].package_index], ctx);
+        if ages.is_empty() {
+            continue; // no evidence for this member — never counts as freshest
+        }
+        let freshest = ages.iter().cloned().fold(f64::INFINITY, f64::min);
+        let is_fresher = match best_age.get(cat) {
+            Some(&current_best) => freshest < current_best,
+            None => true,
+        };
+        if is_fresher {
+            best_age.insert(*cat, freshest);
+            most_used_index.insert(*cat, i);
+        }
+    }
+
     apps.iter()
+        .enumerate()
         .zip(categories)
-        .filter_map(|(app, cat)| {
+        .filter_map(|((i, app), cat)| {
             let cat = cat?;
             let count = *counts.get(&cat)?;
             (count >= 3).then_some(Recommendation {
@@ -228,6 +286,7 @@ fn overlaps(apps: &[AppEntry], desktop_apps: &[DesktopApp]) -> Vec<Recommendatio
                 kind: Kind::Overlap {
                     category: cat,
                     count,
+                    most_used: most_used_index.get(&cat) == Some(&i),
                 },
             })
         })
@@ -502,8 +561,10 @@ mod tests {
                 kinds_for(&recs, i),
                 vec![Kind::Overlap {
                     category: Category::WebBrowser,
-                    count: 3
-                }]
+                    count: 3,
+                    most_used: false,
+                }],
+                "no cache/config dirs exist for any member, so nobody is most_used"
             );
         }
     }
@@ -574,21 +635,112 @@ mod tests {
             desktop_app("Gamma", Some(Category::WebBrowser)),
         ];
         let apps = vec![app("Ambiguous", 0), app("Beta", 1), app("Gamma", 2)];
+        let packages = vec![
+            pacman_pkg("ambiguous"),
+            pacman_pkg("beta"),
+            pacman_pkg("gamma"),
+        ];
+        let f = fixture();
 
         let mut desktop_apps_1 = vec![entry_a.clone(), entry_b.clone()];
         desktop_apps_1.extend(others.iter().cloned());
-        let recs_1 = overlaps(&apps, &desktop_apps_1);
+        let recs_1 = overlaps(&apps, &packages, &desktop_apps_1, &f.ctx);
 
         let mut desktop_apps_2 = vec![entry_b, entry_a];
         desktop_apps_2.extend(others.iter().cloned());
-        let recs_2 = overlaps(&apps, &desktop_apps_2);
+        let recs_2 = overlaps(&apps, &packages, &desktop_apps_2, &f.ctx);
 
         assert_eq!(kinds_for(&recs_1, 0), kinds_for(&recs_2, 0));
         assert_eq!(
             kinds_for(&recs_1, 0),
             vec![Kind::Overlap {
                 category: Category::WebBrowser,
-                count: 3
+                count: 3,
+                most_used: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_most_used_marks_the_group_member_with_the_freshest_activity() {
+        let f = fixture();
+        aged_dir(&f.ctx, ".cache", "alpha", 100);
+        aged_dir(&f.ctx, ".cache", "beta", 10); // freshest (smallest age)
+        aged_dir(&f.ctx, ".cache", "gamma", 200);
+        let packages = vec![pacman_pkg("alpha"), pacman_pkg("beta"), pacman_pkg("gamma")];
+        let apps = vec![app("Alpha", 0), app("Beta", 1), app("Gamma", 2)];
+        let desktop_apps = vec![
+            desktop_app("Alpha", Some(Category::WebBrowser)),
+            desktop_app("Beta", Some(Category::WebBrowser)),
+            desktop_app("Gamma", Some(Category::WebBrowser)),
+        ];
+
+        // Calls `overlaps` directly (not `recommendations`) so the ages
+        // chosen to pin freshness ordering don't also trip the unrelated
+        // `unused` heuristic at its own (much lower) default threshold.
+        let recs = overlaps(&apps, &packages, &desktop_apps, &f.ctx);
+
+        assert_eq!(
+            kinds_for(&recs, 1),
+            vec![Kind::Overlap {
+                category: Category::WebBrowser,
+                count: 3,
+                most_used: true,
+            }]
+        );
+        for i in [0, 2] {
+            assert_eq!(
+                kinds_for(&recs, i),
+                vec![Kind::Overlap {
+                    category: Category::WebBrowser,
+                    count: 3,
+                    most_used: false,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn test_most_used_tie_goes_to_the_first_member_in_apps_order() {
+        let f = fixture();
+        // A single shared timestamp for both dirs, rather than two separate
+        // `aged_dir` calls (each reads its own `SystemTime::now()`), so the
+        // two ages are exactly equal instead of merely close.
+        let old = SystemTime::now() - Duration::from_secs(50 * 86_400);
+        for name in ["alpha", "beta"] {
+            let dir = f.ctx.home.join(".cache").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::File::open(&dir)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+        // gamma has no cache/config dir at all.
+        let packages = vec![pacman_pkg("alpha"), pacman_pkg("beta"), pacman_pkg("gamma")];
+        let apps = vec![app("Alpha", 0), app("Beta", 1), app("Gamma", 2)];
+        let desktop_apps = vec![
+            desktop_app("Alpha", Some(Category::WebBrowser)),
+            desktop_app("Beta", Some(Category::WebBrowser)),
+            desktop_app("Gamma", Some(Category::WebBrowser)),
+        ];
+
+        let recs = overlaps(&apps, &packages, &desktop_apps, &f.ctx);
+
+        assert_eq!(
+            kinds_for(&recs, 0),
+            vec![Kind::Overlap {
+                category: Category::WebBrowser,
+                count: 3,
+                most_used: true,
+            }],
+            "alpha comes first in apps order, so it wins the tie over beta"
+        );
+        assert_eq!(
+            kinds_for(&recs, 1),
+            vec![Kind::Overlap {
+                category: Category::WebBrowser,
+                count: 3,
+                most_used: false,
             }]
         );
     }
