@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use crate::core::runner::runner_for;
 use crate::ctx::Ctx;
@@ -81,6 +82,42 @@ pub fn file_list(ctx: &Ctx, id: &str) -> Vec<String> {
         Ok(out) => out.stdout.lines().map(str::to_string).collect(),
         Err(_) => Vec::new(),
     }
+}
+
+/// Batched `pacman -Qo -- <file1> <file2> ...` to map each of `files` to its
+/// owning package name in one call — used to map installed `.desktop`
+/// launchers back to the package that owns them. A file pacman doesn't own
+/// produces an error line on stderr and a nonzero exit; that's tolerated
+/// here — whatever parses on stdout is kept regardless of the exit status.
+/// If the command fails to run at all (or `files` is empty), the map is
+/// simply empty.
+pub fn owners(ctx: &Ctx, files: &[PathBuf]) -> HashMap<PathBuf, String> {
+    if files.is_empty() {
+        return HashMap::new();
+    }
+    let runner = runner_for(ctx);
+    let mut argv = vec!["pacman".to_string(), "-Qo".to_string(), "--".to_string()];
+    // `display()` is lossy for non-UTF-8 paths, silently mangling those file
+    // names in the argv; acceptable since `.desktop` paths are ASCII in practice.
+    argv.extend(files.iter().map(|f| f.display().to_string()));
+    match runner.run(&argv) {
+        Ok(out) => parse_owners(&out.stdout),
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// Parses `pacman -Qo`'s `<path> is owned by <pkg> <version>` lines.
+fn parse_owners(text: &str) -> HashMap<PathBuf, String> {
+    text.lines()
+        .filter_map(|line| {
+            // Splits on the first " is owned by "; a path containing that
+            // exact substring would misparse, but that requires a filename
+            // collision with pacman's own output phrasing to matter.
+            let (path, rest) = line.split_once(" is owned by ")?;
+            let pkg = rest.split_whitespace().next()?;
+            Some((PathBuf::from(path.trim()), pkg.to_string()))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -226,6 +263,65 @@ mod tests {
                 "-suspicious".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn test_owners_parses_qo_output_into_a_path_to_package_map() {
+        let mut c = ctx();
+        let files = vec![PathBuf::from("/usr/share/applications/foo.desktop")];
+        c.fake_command_output = Some(HashMap::from([(
+            vec![
+                "pacman".to_string(),
+                "-Qo".to_string(),
+                "--".to_string(),
+                "/usr/share/applications/foo.desktop".to_string(),
+            ],
+            cmd_output("/usr/share/applications/foo.desktop is owned by foo 1.0-1\n"),
+        )]));
+
+        let owners = owners(&c, &files);
+        assert_eq!(owners.get(&files[0]), Some(&"foo".to_string()));
+    }
+
+    #[test]
+    fn test_owners_is_empty_for_empty_file_list() {
+        assert!(owners(&ctx(), &[]).is_empty());
+    }
+
+    #[test]
+    fn test_owners_tolerates_partial_failure_and_keeps_what_parsed() {
+        let mut c = ctx();
+        let files = vec![
+            PathBuf::from("/usr/share/applications/foo.desktop"),
+            PathBuf::from("/usr/share/applications/unowned.desktop"),
+        ];
+        c.fake_command_output = Some(HashMap::from([(
+            vec![
+                "pacman".to_string(),
+                "-Qo".to_string(),
+                "--".to_string(),
+                "/usr/share/applications/foo.desktop".to_string(),
+                "/usr/share/applications/unowned.desktop".to_string(),
+            ],
+            CmdOutput {
+                success: false,
+                stdout: "/usr/share/applications/foo.desktop is owned by foo 1.0-1\n".to_string(),
+                stderr: "error: No package owns /usr/share/applications/unowned.desktop\n"
+                    .to_string(),
+            },
+        )]));
+
+        let owners = owners(&c, &files);
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners.get(&files[0]), Some(&"foo".to_string()));
+    }
+
+    #[test]
+    fn test_owners_is_empty_when_the_whole_command_fails_to_run() {
+        // No canned output for this argv -> the runner errors, and that's
+        // tolerated as "no owners found" rather than propagated.
+        let files = vec![PathBuf::from("/usr/share/applications/foo.desktop")];
+        assert!(owners(&ctx(), &files).is_empty());
     }
 
     #[test]

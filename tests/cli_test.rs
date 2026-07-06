@@ -31,6 +31,21 @@ fn test_parses_uninstall_subcommand() {
 }
 
 #[test]
+fn test_parses_uninstall_packages_flag() {
+    let cli = parse(&["badger", "uninstall", "--packages"]).unwrap();
+    match cli.command {
+        badger::cli::Command::Uninstall { packages } => assert!(packages),
+        _ => panic!("expected Uninstall"),
+    }
+
+    let cli = parse(&["badger", "uninstall"]).unwrap();
+    match cli.command {
+        badger::cli::Command::Uninstall { packages } => assert!(!packages),
+        _ => panic!("expected Uninstall"),
+    }
+}
+
+#[test]
 fn test_parses_optimize_subcommand() {
     assert!(parse(&["badger", "optimize"]).is_ok());
 }

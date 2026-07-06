@@ -73,14 +73,14 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Uninstall => {
+        Command::Uninstall { packages } => {
             let ctx = crate::ctx::Ctx::resolve(
                 cli.dry_run,
                 cli.debug,
                 crate::ctx::EnvOverrides::from_process(),
             )?;
             let mode = crate::output::current(cli.json);
-            let output = uninstall::run(&ctx, cli.dry_run, mode)?;
+            let output = uninstall::run(&ctx, cli.dry_run, mode, packages)?;
             // Interactive cancel prints its own "nothing uninstalled" note
             // to stderr and returns nothing to render — don't add a blank
             // stdout line on top of it.

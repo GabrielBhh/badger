@@ -31,14 +31,23 @@ pub struct UninstallOutput {
 /// `badger uninstall` only ever runs interactively: `--json`, a non-tty
 /// stdout (both of which `output::current` already folds into `Mode::Json`),
 /// or a non-tty stderr all mean there is no terminal to drive the picker on.
-pub fn run(ctx: &Ctx, dry_run_flag: bool, mode: Mode) -> anyhow::Result<UninstallOutput> {
+pub fn run(
+    ctx: &Ctx,
+    dry_run_flag: bool,
+    mode: Mode,
+    packages_first: bool,
+) -> anyhow::Result<UninstallOutput> {
     if mode != Mode::Human || !std::io::stderr().is_terminal() {
         anyhow::bail!("badger uninstall requires an interactive terminal");
     }
-    run_interactive(ctx, dry_run_flag)
+    run_interactive(ctx, dry_run_flag, packages_first)
 }
 
-fn run_interactive(ctx: &Ctx, dry_run_flag: bool) -> anyhow::Result<UninstallOutput> {
+fn run_interactive(
+    ctx: &Ctx,
+    dry_run_flag: bool,
+    packages_first: bool,
+) -> anyhow::Result<UninstallOutput> {
     eprintln!("Scanning installed packages — this can take a moment...");
     let packages = crate::pkg::list_installed(ctx);
     if packages.is_empty() {
@@ -47,8 +56,11 @@ fn run_interactive(ctx: &Ctx, dry_run_flag: bool) -> anyhow::Result<UninstallOut
         });
     }
 
+    eprintln!("Reading applications...");
+    let apps = crate::pkg::applications(ctx, &packages);
+
     let mut terminal = tui::init_terminal()?;
-    let pick_result = drive_picker(&mut terminal, packages);
+    let pick_result = drive_picker(&mut terminal, packages, apps, packages_first);
     let package = match pick_result {
         Ok(Some(package)) => package,
         Ok(None) => {
@@ -303,8 +315,14 @@ fn remove_argv_for(package: &InstalledPackage) -> (Vec<String>, bool) {
 fn drive_picker(
     terminal: &mut tui::Term,
     items: Vec<InstalledPackage>,
+    apps: Vec<crate::pkg::AppEntry>,
+    packages_first: bool,
 ) -> anyhow::Result<Option<InstalledPackage>> {
-    let mut state = picker::PickerState::new(items);
+    let mut state = if packages_first {
+        picker::PickerState::new_starting_with_packages(items, apps)
+    } else {
+        picker::PickerState::new(items, apps)
+    };
     let colors = tui::colors_enabled_now();
     loop {
         terminal.draw(|f| picker::render(f, &state, colors))?;
@@ -321,6 +339,7 @@ fn drive_picker(
             Some(picker::Action::Up) => state.move_up(),
             Some(picker::Action::Type(c)) => state.push_char(c),
             Some(picker::Action::Backspace) => state.backspace(),
+            Some(picker::Action::ToggleView) => state.toggle_view(),
             Some(picker::Action::Cancel) => return Ok(None),
             Some(picker::Action::Select) => {
                 if let Some(package) = state.selected() {
@@ -417,7 +436,7 @@ mod tests {
     #[test]
     fn test_run_bails_when_mode_is_not_human() {
         let f = fixture();
-        let err = run(&f.ctx, false, Mode::Json).unwrap_err();
+        let err = run(&f.ctx, false, Mode::Json, false).unwrap_err();
         assert!(err.to_string().contains("interactive terminal"));
     }
 

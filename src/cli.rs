@@ -42,7 +42,11 @@ pub enum Command {
         experimental: bool,
     },
     /// Uninstall unused packages
-    Uninstall,
+    Uninstall {
+        /// list raw package names instead of applications
+        #[arg(long)]
+        packages: bool,
+    },
     /// Optimize mirrors and system settings
     Optimize {
         /// Actually run pre-checked tasks (default just plans)
