@@ -405,14 +405,16 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &ChecklistState, colors: 
         .sum::<usize>();
 
     let mut status = format!("{count} selected · {total}");
+    // Risky note first: the footer line clips (no wrap) on narrow terminals,
+    // and the safety-relevant note must survive truncation.
+    if risky > 0 {
+        status.push_str(&format!(" · {risky} risky need typed confirm"));
+    }
     if recent > 0 {
         status.push_str(&format!(" · {recent} recent excluded — space includes"));
     }
     if whitelisted > 0 {
         status.push_str(&format!(" · {whitelisted} whitelisted (locked)"));
-    }
-    if risky > 0 {
-        status.push_str(&format!(" · {risky} risky need typed confirm"));
     }
 
     let key_style = if colors {
