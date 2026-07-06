@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::text::Line;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::output::humanize_bytes;
@@ -371,7 +372,6 @@ pub fn body_height(frame_height: u16) -> usize {
 }
 
 pub fn render(frame: &mut Frame, state: &PickerState, colors: bool) {
-    let _ = colors; // reserved for parity with checklist::render's signature; no color use yet
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -407,7 +407,7 @@ pub fn render(frame: &mut Frame, state: &PickerState, colors: bool) {
             } else {
                 &[]
             };
-            render_row(row, i == state.cursor(), recommendations)
+            render_row(row, i == state.cursor(), recommendations, colors)
         })
         .collect();
     frame.render_widget(Paragraph::new(body), chunks[1]);
@@ -426,32 +426,73 @@ pub fn render(frame: &mut Frame, state: &PickerState, colors: bool) {
     frame.render_widget(Paragraph::new(vec![Line::from(footer_text)]), chunks[2]);
 }
 
-fn render_row(row: &PickerRow, is_cursor: bool, recommendations: &[Kind]) -> Line<'static> {
+fn render_row(
+    row: &PickerRow,
+    is_cursor: bool,
+    recommendations: &[Kind],
+    colors: bool,
+) -> Line<'static> {
     let marker = if is_cursor { ">" } else { " " };
     let size = match row.package.size_bytes {
         Some(bytes) => format!("  {}", humanize_bytes(bytes)),
         None => String::new(),
     };
-    let hints: String = recommendations
-        .iter()
-        .map(|k| format!("  {}", recommendation_text(k)))
-        .collect();
-    Line::from(format!(
-        "{marker} {} {} [{}]{size}{hints}",
+    let mut spans = vec![Span::raw(format!(
+        "{marker} {} {} [{}]{size}",
         row.display_name,
         row.package.version,
         badge(row.package)
-    ))
+    ))];
+    for kind in recommendations {
+        spans.push(Span::raw("  "));
+        spans.extend(recommendation_spans(kind, colors));
+    }
+    Line::from(spans)
 }
 
-/// The advisory suffix text for one recommendation kind, e.g. `dup w/
-/// flatpak`, `unused ~6mo`, `1 of 4 browsers` — always a plain-language
-/// guess, never phrased as a directive.
-fn recommendation_text(kind: &Kind) -> String {
+/// The advisory suffix spans for one recommendation kind, e.g. `also via
+/// flatpak`, `unused ~6mo`, `1 of 4 browsers` (plus `· most used` when
+/// flagged) — always plain-language guesses, never phrased as a directive.
+/// Reads as one system: duplicate is yellow, unused is dim, and a most-used
+/// overlap marker is green — wording alone carries the meaning when `colors`
+/// is off (`NO_COLOR`).
+fn recommendation_spans(kind: &Kind, colors: bool) -> Vec<Span<'static>> {
     match kind {
-        Kind::Duplicate { other_backend } => format!("dup w/ {}", other_backend.label()),
-        Kind::Unused { months } => format!("unused ~{months}mo"),
-        Kind::Overlap { category, count } => format!("1 of {count} {}", category_word(*category)),
+        Kind::Duplicate { other_backend } => {
+            let style = if colors {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            };
+            vec![Span::styled(
+                format!("also via {}", other_backend.label()),
+                style,
+            )]
+        }
+        Kind::Unused { months } => vec![Span::styled(
+            format!("unused ~{months}mo"),
+            Style::default().add_modifier(Modifier::DIM),
+        )],
+        Kind::Overlap {
+            category,
+            count,
+            most_used,
+        } => {
+            let mut spans = vec![Span::raw(format!(
+                "1 of {count} {}",
+                category_word(*category)
+            ))];
+            if *most_used {
+                let style = if colors {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default()
+                };
+                spans.push(Span::raw(" · "));
+                spans.push(Span::styled("most used", style));
+            }
+            spans
+        }
     }
 }
 
@@ -799,11 +840,15 @@ mod tests {
     }
 
     fn draw(state: &PickerState) -> Buffer {
+        draw_with_colors(state, true)
+    }
+
+    fn draw_with_colors(state: &PickerState, colors: bool) -> Buffer {
         // Wide enough that the footer's "tab: ..." hint isn't clipped —
         // ratatui's Paragraph doesn't wrap by default.
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, state, true)).unwrap();
+        terminal.draw(|f| render(f, state, colors)).unwrap();
         terminal.backend().buffer().clone()
     }
 
@@ -1087,6 +1132,7 @@ mod tests {
                 kind: Kind::Overlap {
                     category: Category::WebBrowser,
                     count: 3,
+                    most_used: false,
                 },
             },
             recommend::Recommendation {
@@ -1094,6 +1140,7 @@ mod tests {
                 kind: Kind::Overlap {
                     category: Category::WebBrowser,
                     count: 3,
+                    most_used: true,
                 },
             },
         ]
@@ -1235,14 +1282,113 @@ mod tests {
         state.set_recommendations(recommendation_fixture_recs());
 
         let text = full_text(&draw(&state));
-        assert!(text.contains("Firefox 121.0 [pacman]  dup w/ flatpak"));
+        assert!(text.contains("Firefox 121.0 [pacman]  also via flatpak"));
         assert!(text.contains("OldApp 1.0 [pacman]  unused ~6mo"));
         assert!(text.contains("Chromium 1.0 [pacman]  1 of 3 browsers"));
+        assert!(text.contains("Brave 1.0 [pacman]  1 of 3 browsers · most used"));
         let plain_row = text.lines().find(|l| l.contains("PlainApp")).unwrap();
         assert!(
             plain_row.trim_end().ends_with("[pacman]"),
             "an app with no recommendation gets no badge suffix"
         );
+    }
+
+    #[test]
+    fn test_duplicate_badge_is_yellow_when_colors_are_on() {
+        let (items, apps) = recommendation_fixture();
+        let mut state = PickerState::new(items, apps);
+        state.set_recommendations(recommendation_fixture_recs());
+
+        let buffer = draw_with_colors(&state, true);
+        let y = (0..buffer.area.height)
+            .find(|&y| row_text(&buffer, y).contains("also via flatpak"))
+            .unwrap();
+        let x = row_text(&buffer, y).find("also via flatpak").unwrap() as u16;
+        assert_eq!(buffer.cell((x, y)).unwrap().fg, Color::Yellow);
+    }
+
+    #[test]
+    fn test_duplicate_badge_has_no_color_under_no_color() {
+        let (items, apps) = recommendation_fixture();
+        let mut state = PickerState::new(items, apps);
+        state.set_recommendations(recommendation_fixture_recs());
+
+        let buffer = draw_with_colors(&state, false);
+        let y = (0..buffer.area.height)
+            .find(|&y| row_text(&buffer, y).contains("also via flatpak"))
+            .unwrap();
+        let x = row_text(&buffer, y).find("also via flatpak").unwrap() as u16;
+        assert_eq!(buffer.cell((x, y)).unwrap().fg, Color::Reset);
+        assert!(
+            row_text(&buffer, y).contains("also via flatpak"),
+            "wording alone still carries the meaning without color"
+        );
+    }
+
+    #[test]
+    fn test_most_used_suffix_is_green_when_colors_are_on() {
+        let (items, apps) = recommendation_fixture();
+        let mut state = PickerState::new(items, apps);
+        state.set_recommendations(recommendation_fixture_recs());
+
+        let buffer = draw_with_colors(&state, true);
+        let y = (0..buffer.area.height)
+            .find(|&y| row_text(&buffer, y).contains("most used"))
+            .unwrap();
+        let x = row_text(&buffer, y).find("most used").unwrap() as u16;
+        assert_eq!(buffer.cell((x, y)).unwrap().fg, Color::Green);
+    }
+
+    #[test]
+    fn test_most_used_suffix_has_no_color_under_no_color_but_keeps_the_wording() {
+        let (items, apps) = recommendation_fixture();
+        let mut state = PickerState::new(items, apps);
+        state.set_recommendations(recommendation_fixture_recs());
+
+        let buffer = draw_with_colors(&state, false);
+        let text = full_text(&buffer);
+        assert!(text.contains("1 of 3 browsers · most used"));
+        let y = (0..buffer.area.height)
+            .find(|&y| row_text(&buffer, y).contains("most used"))
+            .unwrap();
+        let x = row_text(&buffer, y).find("most used").unwrap() as u16;
+        assert_eq!(buffer.cell((x, y)).unwrap().fg, Color::Reset);
+    }
+
+    #[test]
+    fn test_unused_badge_is_dim_regardless_of_colors_setting() {
+        let (items, apps) = recommendation_fixture();
+        let mut state = PickerState::new(items, apps);
+        state.set_recommendations(recommendation_fixture_recs());
+
+        for colors in [true, false] {
+            let buffer = draw_with_colors(&state, colors);
+            let y = (0..buffer.area.height)
+                .find(|&y| row_text(&buffer, y).contains("unused ~6mo"))
+                .unwrap();
+            let x = row_text(&buffer, y).find("unused ~6mo").unwrap() as u16;
+            assert!(
+                buffer
+                    .cell((x, y))
+                    .unwrap()
+                    .modifier
+                    .contains(Modifier::DIM),
+                "unused badge must stay dim with colors={colors}"
+            );
+        }
+    }
+
+    // Regression guard for the longer "· most used" wording: the row must
+    // still render in full (not silently truncated) once the combined badge
+    // text is wider than the old "dup w/ ..." phrasing was.
+    #[test]
+    fn test_overlap_row_with_most_used_suffix_renders_in_full_at_adequate_width() {
+        let (items, apps) = recommendation_fixture();
+        let mut state = PickerState::new(items, apps);
+        state.set_recommendations(recommendation_fixture_recs());
+
+        let text = full_text(&draw_sized(&state, 100, 24));
+        assert!(text.contains("Brave 1.0 [pacman]  1 of 3 browsers · most used"));
     }
 
     #[test]
@@ -1276,8 +1422,9 @@ mod tests {
         assert_eq!(state.view(), View::Packages);
 
         let text = full_text(&draw(&state));
-        assert!(!text.contains("dup w/"));
+        assert!(!text.contains("also via"));
         assert!(!text.contains("unused ~"));
         assert!(!text.contains(" browsers"));
+        assert!(!text.contains("most used"));
     }
 }
