@@ -112,7 +112,12 @@ fn run_interactive(
     } else {
         let groups = vec![leftover_group.clone()];
         let mut terminal = tui::init_terminal()?;
-        let selection_result = drive_selection(&mut terminal, groups.clone());
+        let selection_result = drive_selection(
+            &mut terminal,
+            groups.clone(),
+            confirm::Verb::Delete,
+            dry_run_flag,
+        );
         tui::restore_terminal(&mut terminal)?;
         match selection_result? {
             Some(selection) => selection,

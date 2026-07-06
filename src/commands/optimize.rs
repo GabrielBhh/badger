@@ -113,7 +113,12 @@ fn run_interactive(ctx: &Ctx, dry_run_flag: bool) -> anyhow::Result<OptimizeOutp
     }
 
     let mut terminal = tui::init_terminal()?;
-    let selection_result = drive_selection(&mut terminal, groups.clone());
+    let selection_result = drive_selection(
+        &mut terminal,
+        groups.clone(),
+        tui::confirm::Verb::Run,
+        dry_run_flag,
+    );
     // Leave the alternate screen before anything else happens: a sudo
     // prompt (during execution below) and the final summary (printed by our
     // caller once we return) both need a normal, scrollable terminal.

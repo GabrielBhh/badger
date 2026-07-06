@@ -30,6 +30,8 @@ pub(crate) struct JsonOutput<'a> {
 pub(crate) fn drive_selection(
     terminal: &mut tui::Term,
     groups: Vec<Group>,
+    verb: confirm::Verb,
+    dry_run: bool,
 ) -> anyhow::Result<Option<HashSet<(usize, usize)>>> {
     let mut state = checklist::ChecklistState::new(groups);
     let mut confirming: Option<confirm::ConfirmState> = None;
@@ -38,7 +40,7 @@ pub(crate) fn drive_selection(
     loop {
         let height = terminal.size()?.height;
         if let Some(confirm_state) = &confirming {
-            terminal.draw(|f| confirm::render(f, confirm_state))?;
+            terminal.draw(|f| confirm::render(f, confirm_state, colors))?;
         } else {
             state.scroll_into_view(checklist::body_height(height));
             terminal.draw(|f| checklist::render(f, &state, colors))?;
@@ -70,7 +72,7 @@ pub(crate) fn drive_selection(
             Some(checklist::Action::Bottom) => state.bottom(),
             Some(checklist::Action::Cancel) => return Ok(None),
             Some(checklist::Action::Confirm) => {
-                confirming = Some(confirm::ConfirmState::from_checklist(&state));
+                confirming = Some(confirm::ConfirmState::from_checklist(&state, verb, dry_run));
             }
             None => {}
         }

@@ -1862,7 +1862,7 @@ mod tests {
         assert!(text.contains("/scan/root/big"));
         assert!(text.contains("size: 7.8 KiB"));
         assert!(text.contains("moves to trash — recoverable"));
-        assert!(text.contains("y proceed  n/esc back"));
+        assert!(text.contains("y confirm · n back"));
     }
 
     #[test]
