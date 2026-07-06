@@ -39,6 +39,8 @@ pub struct PickerState {
     filtered: Vec<usize>,
     /// Index into `filtered`, not into `apps`/`items`.
     cursor: usize,
+    /// First row index of `filtered` currently drawn at the body's top.
+    scroll: usize,
 }
 
 impl PickerState {
@@ -58,6 +60,7 @@ impl PickerState {
             filter: String::new(),
             filtered: Vec::new(),
             cursor: 0,
+            scroll: 0,
         };
         state.recompute_filter();
         state
@@ -185,6 +188,7 @@ impl PickerState {
                 .collect(),
         };
         self.cursor = 0;
+        self.scroll = 0;
     }
 
     pub fn move_down(&mut self) {
@@ -195,6 +199,28 @@ impl PickerState {
 
     pub fn move_up(&mut self) {
         self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll
+    }
+
+    /// Adjusts the scroll offset (if needed) so the cursor stays inside a
+    /// `viewport_height`-row window. Callers must invoke this with the body
+    /// area's height before rendering — mirrors `ExplorerState::scroll_into_view`.
+    pub fn scroll_into_view(&mut self, viewport_height: usize) {
+        if viewport_height == 0 {
+            return;
+        }
+        if self.cursor < self.scroll {
+            self.scroll = self.cursor;
+        } else if self.cursor >= self.scroll + viewport_height {
+            self.scroll = self.cursor + 1 - viewport_height;
+        }
+        let max_scroll = self.filtered.len().saturating_sub(viewport_height);
+        if self.scroll > max_scroll {
+            self.scroll = max_scroll;
+        }
     }
 }
 
@@ -237,6 +263,12 @@ fn badge(package: &InstalledPackage) -> &'static str {
     }
 }
 
+/// Body area height a caller should pass to `scroll_into_view` for a frame
+/// of total height `frame_height` (accounting for the fixed header/footer).
+pub fn body_height(frame_height: u16) -> usize {
+    frame_height.saturating_sub(4) as usize
+}
+
 pub fn render(frame: &mut Frame, state: &PickerState, colors: bool) {
     let _ = colors; // reserved for parity with checklist::render's signature; no color use yet
     let chunks = Layout::default()
@@ -265,6 +297,8 @@ pub fn render(frame: &mut Frame, state: &PickerState, colors: bool) {
         .visible()
         .iter()
         .enumerate()
+        .skip(state.scroll_offset())
+        .take(chunks[1].height as usize)
         .map(|(i, row)| render_row(row, i == state.cursor()))
         .collect();
     frame.render_widget(Paragraph::new(body), chunks[1]);
@@ -690,6 +724,104 @@ mod tests {
     // zero-width graphemes when writing cells. This test pins that upstream
     // behavior: if a future hand-rolled truncation/rendering path replaced
     // `set_stringn`'s use and dropped the filtering, this would catch it.
+    // --- scrolling ---
+
+    fn many_packages(n: usize) -> Vec<InstalledPackage> {
+        (0..n)
+            .map(|i| package(&format!("pkg-{i:02}"), "1.0", Backend::Pacman, false))
+            .collect()
+    }
+
+    fn draw_sized(state: &PickerState, width: u16, height: u16) -> Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, state, true)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    // Regression for the reported bug: moving the cursor down past the
+    // bottom of the terminal didn't scroll the list — render always drew
+    // from row 0 (no scroll offset existed), so the highlighted row walked
+    // off the visible window instead of the window following it down.
+    #[test]
+    fn test_scrolling_down_past_viewport_brings_cursor_row_into_view() {
+        let mut state = PickerState::new(many_packages(30), Vec::new());
+        for _ in 0..20 {
+            state.move_down();
+        }
+        assert_eq!(state.cursor(), 20);
+        state.scroll_into_view(8); // 80x12 terminal: 12 - 4 fixed rows = 8
+        let text = full_text(&draw_sized(&state, 80, 12));
+        assert!(text.contains("pkg-20"), "cursor row must be visible");
+        assert!(!text.contains("pkg-00"), "window must have scrolled down");
+    }
+
+    #[test]
+    fn test_scrolling_back_up_above_viewport_brings_cursor_row_into_view() {
+        let mut state = PickerState::new(many_packages(30), Vec::new());
+        for _ in 0..25 {
+            state.move_down();
+        }
+        state.scroll_into_view(8);
+        assert!(state.scroll_offset() > 0);
+        for _ in 0..20 {
+            state.move_up();
+        }
+        assert_eq!(state.cursor(), 5);
+        state.scroll_into_view(8);
+        let text = full_text(&draw_sized(&state, 80, 12));
+        assert!(
+            text.contains("pkg-05"),
+            "window must have followed cursor up"
+        );
+    }
+
+    #[test]
+    fn test_filter_narrowing_after_scroll_clamps_cursor_and_offset() {
+        let mut state = PickerState::new(many_packages(30), Vec::new());
+        for _ in 0..20 {
+            state.move_down();
+        }
+        state.scroll_into_view(8);
+        assert!(state.scroll_offset() > 0);
+        // Narrow to a single match: recompute_filter resets the cursor to
+        // 0, and the offset must be re-clamped against the now-tiny list
+        // rather than pointing past its end (no panic either).
+        for c in "pkg-05".chars() {
+            state.push_char(c);
+        }
+        assert_eq!(state.visible().len(), 1);
+        assert_eq!(state.cursor(), 0);
+        state.scroll_into_view(8);
+        assert_eq!(state.scroll_offset(), 0);
+        let text = full_text(&draw_sized(&state, 80, 12));
+        assert!(text.contains("> pkg-05"), "selected row must be visible");
+    }
+
+    #[test]
+    fn test_toggle_view_from_scrolled_position_keeps_cursor_visible() {
+        let apps: Vec<AppEntry> = (0..30)
+            .map(|i| AppEntry {
+                display_name: format!("App-{i:02}"),
+                package_index: 0,
+            })
+            .collect();
+        let mut state = PickerState::new(many_packages(30), apps);
+        assert_eq!(state.view(), View::Apps);
+        for _ in 0..20 {
+            state.move_down();
+        }
+        state.scroll_into_view(8);
+        assert!(state.scroll_offset() > 0);
+        state.toggle_view();
+        assert_eq!(state.view(), View::Packages);
+        assert_eq!(state.cursor(), 0);
+        state.scroll_into_view(8);
+        assert_eq!(state.scroll_offset(), 0, "offset must reset with the view");
+        let text = full_text(&draw_sized(&state, 80, 12));
+        assert!(text.contains("> pkg-00"), "cursor row must be visible");
+    }
+
     #[test]
     fn test_render_filters_hostile_desktop_name_control_and_bidi_chars() {
         let hostile_prefix = "PWNED\x1b[31m\x1b\u{202E}";
