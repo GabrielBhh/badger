@@ -1209,6 +1209,25 @@ mod tests {
         assert_eq!(state.visible().len(), 6, "all packages still shown");
     }
 
+    // Deliberate UX: `toggle_view` (Tab) resets the text filter but leaves
+    // `recommended_only` untouched, so switching to Packages and back to Apps
+    // doesn't silently drop the recommended-only narrowing.
+    #[test]
+    fn test_recommended_only_survives_a_tab_round_trip() {
+        let (items, apps) = recommendation_fixture();
+        let mut state = PickerState::new(items, apps);
+        state.set_recommendations(recommendation_fixture_recs());
+        state.toggle_recommended_only();
+        assert!(state.recommended_only());
+
+        state.toggle_view();
+        assert_eq!(state.view(), View::Packages);
+        state.toggle_view();
+        assert_eq!(state.view(), View::Apps);
+
+        assert!(state.recommended_only(), "recommended_only survives Tab");
+    }
+
     #[test]
     fn test_render_shows_recommendation_badges_in_apps_view() {
         let (items, apps) = recommendation_fixture();
