@@ -127,6 +127,11 @@ fn test_parses_hidden_helper_subcommand() {
 }
 
 #[test]
+fn test_parses_hidden_mangen_subcommand() {
+    assert!(parse(&["badger", "__mangen", "/some/dir"]).is_ok());
+}
+
+#[test]
 fn test_global_flags_parse_before_subcommand() {
     let cli = parse(&["badger", "--dry-run", "--json", "--debug", "clean"]).unwrap();
     assert!(cli.dry_run);
@@ -158,4 +163,5 @@ fn test_help_lists_visible_subcommands_but_not_helper() {
     let help = Cli::command().render_long_help().to_string();
     assert!(help.contains("clean"));
     assert!(!help.contains("__helper"));
+    assert!(!help.contains("__mangen"));
 }

@@ -79,6 +79,8 @@ pub enum Command {
     Completion { shell: clap_complete::Shell },
     #[command(name = "__helper", hide = true)]
     Helper,
+    #[command(name = "__mangen", hide = true)]
+    Mangen { dir: std::path::PathBuf },
 }
 
 #[derive(Subcommand, Debug)]

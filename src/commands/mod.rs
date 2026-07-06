@@ -7,6 +7,7 @@ use crate::cli::{Cli, Command, WhitelistAction};
 pub mod analyze;
 pub mod clean;
 pub mod history;
+pub mod mangen;
 pub mod optimize;
 pub mod purge;
 pub(crate) mod shared;
@@ -55,6 +56,7 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Helper => {
             crate::privilege::helper_main(std::io::stdin().lock(), std::io::stdout().lock())
         }
+        Command::Mangen { dir } => mangen::run(&dir),
         Command::Clean { yes, experimental } => {
             let ctx = crate::ctx::Ctx::resolve(
                 cli.dry_run,
