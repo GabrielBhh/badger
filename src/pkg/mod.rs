@@ -4,6 +4,7 @@
 //! nothing here ever shells out directly — so tests never run real pacman/
 //! flatpak/snap.
 
+pub mod desktop;
 pub mod flatpak;
 pub mod pacman;
 pub mod snap;
