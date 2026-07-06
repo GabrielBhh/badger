@@ -304,7 +304,9 @@ fn drive_picker(
     terminal: &mut tui::Term,
     items: Vec<InstalledPackage>,
 ) -> anyhow::Result<Option<InstalledPackage>> {
-    let mut state = picker::PickerState::new(items);
+    // Slice 4 wires the real Applications view in via `crate::pkg::applications`;
+    // this slice only adds the toggling machinery to `PickerState` itself.
+    let mut state = picker::PickerState::new(items, Vec::new());
     let colors = tui::colors_enabled_now();
     loop {
         terminal.draw(|f| picker::render(f, &state, colors))?;
@@ -321,6 +323,7 @@ fn drive_picker(
             Some(picker::Action::Up) => state.move_up(),
             Some(picker::Action::Type(c)) => state.push_char(c),
             Some(picker::Action::Backspace) => state.backspace(),
+            Some(picker::Action::ToggleView) => state.toggle_view(),
             Some(picker::Action::Cancel) => return Ok(None),
             Some(picker::Action::Select) => {
                 if let Some(package) = state.selected() {
