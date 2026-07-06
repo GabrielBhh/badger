@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::core::item::Risk;
-use crate::output::humanize_bytes;
+use crate::output::{count_label, humanize_bytes};
 use crate::tui::checklist::ChecklistState;
 
 /// What the confirmation is about to do, for plain-language wording.
@@ -231,16 +231,6 @@ pub fn render_plain(frame: &mut Frame, state: &PlainConfirmState) {
     frame.render_widget(Paragraph::new(lines), frame.area());
 }
 
-/// Formats a count with its noun, singular or plural: `plural_count(1,
-/// "item")` -> `"1 item"`, `plural_count(5, "item")` -> `"5 items"`.
-fn plural_count(n: usize, noun: &str) -> String {
-    if n == 1 {
-        format!("1 {noun}")
-    } else {
-        format!("{n} {noun}s")
-    }
-}
-
 /// Builds a key-hint line matching the checklist footer's style: each
 /// `(key, label)` pair renders as a colored key followed by its plain-text
 /// label, separated by " · ".
@@ -290,10 +280,10 @@ pub fn render(frame: &mut Frame, state: &ConfirmState, colors: bool) {
     let headline = match state.verb {
         Verb::Delete => format!(
             "Deletes {} ({})",
-            plural_count(state.total_count(), "item"),
+            count_label(state.total_count(), "item"),
             humanize_bytes(state.total_bytes())
         ),
-        Verb::Run => format!("Runs {}", plural_count(state.total_count(), "task")),
+        Verb::Run => format!("Runs {}", count_label(state.total_count(), "task")),
     };
     lines.push(Line::from(headline));
 
@@ -307,7 +297,7 @@ pub fn render(frame: &mut Frame, state: &ConfirmState, colors: bool) {
             lines.push(Line::from(format!(
                 "  • {} — {}, {}",
                 group.title,
-                plural_count(group.count, "item"),
+                count_label(group.count, "item"),
                 humanize_bytes(group.bytes)
             )));
         }
@@ -341,7 +331,7 @@ pub fn render(frame: &mut Frame, state: &ConfirmState, colors: bool) {
                 format!(
                     "  ! {} — {}, {} — type {} to confirm",
                     group.title,
-                    plural_count(group.count, "item"),
+                    count_label(group.count, "item"),
                     humanize_bytes(group.bytes),
                     state.risky_required_count
                 ),

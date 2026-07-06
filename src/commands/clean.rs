@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 use std::io::IsTerminal;
 
-use crate::commands::shared::{JsonOutput, count_label, drive_selection, summarize_run};
+use crate::commands::shared::{JsonOutput, drive_selection, summarize_run};
 use crate::core::exec::{DryRunEffector, RealEffector, Summary, execute, execute_selected};
 use crate::core::item::{Group, Risk};
 use crate::core::runner::RealRunner;
 use crate::core::scan::scan;
 use crate::ctx::Ctx;
-use crate::output::{Mode, humanize_bytes};
+use crate::output::{Mode, count_label, humanize_bytes};
 use crate::rules::{self, Action, Rule};
 use crate::safety::journal::Journal;
 use crate::safety::whitelist::Whitelist;

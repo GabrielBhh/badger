@@ -104,14 +104,3 @@ pub(crate) fn summarize_run(
     }
     Ok((ran, skipped, notes))
 }
-
-/// Pluralizes a count for the execution summaries below: `1 item` / `2
-/// items`, `1 task` / `2 tasks`. Every unit used here pluralizes by simply
-/// appending `s`.
-pub(crate) fn count_label(n: usize, unit: &str) -> String {
-    if n == 1 {
-        format!("1 {unit}")
-    } else {
-        format!("{n} {unit}s")
-    }
-}

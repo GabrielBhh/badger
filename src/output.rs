@@ -32,6 +32,17 @@ pub fn humanize_bytes(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
+/// Formats a count with its noun, singular or plural: `count_label(1,
+/// "item")` -> `"1 item"`, `count_label(5, "item")` -> `"5 items"`. Every
+/// noun used here pluralizes by simply appending `s`.
+pub fn count_label(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,6 +65,13 @@ mod tests {
     #[test]
     fn test_tty_no_flags_is_human() {
         assert_eq!(decide(false, false, true), Mode::Human);
+    }
+
+    #[test]
+    fn test_count_label_singular_and_plural() {
+        assert_eq!(count_label(1, "item"), "1 item");
+        assert_eq!(count_label(0, "item"), "0 items");
+        assert_eq!(count_label(5, "task"), "5 tasks");
     }
 
     #[test]

@@ -10,12 +10,12 @@ use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use crate::commands::shared::{JsonOutput, count_label, drive_selection, summarize_run};
+use crate::commands::shared::{JsonOutput, drive_selection, summarize_run};
 use crate::core::exec::{DryRunEffector, Effector, RealEffector, Summary};
 use crate::core::item::Group;
 use crate::core::runner::RealRunner;
 use crate::ctx::Ctx;
-use crate::output::{Mode, humanize_bytes};
+use crate::output::{Mode, count_label, humanize_bytes};
 use crate::purge;
 use crate::rules::expand_path_spec;
 use crate::safety::journal::{Journal, Record};
