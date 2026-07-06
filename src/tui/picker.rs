@@ -52,7 +52,7 @@ pub struct PickerState {
     /// until `set_recommendations` is called. Display-only: never affects
     /// `selected()`.
     recommendations: HashMap<usize, Vec<Kind>>,
-    /// `r`-toggled "recommended only" filter, narrowing and re-sorting the
+    /// Ctrl-R-toggled "recommended only" filter, narrowing and re-sorting the
     /// Apps view on top of the text filter.
     recommended_only: bool,
 }
@@ -176,7 +176,7 @@ impl PickerState {
     }
 
     /// Whether at least one app carries a recommendation at all — the
-    /// footer's `r: recommended` hint (Apps view only) is conditional on
+    /// footer's `ctrl-r recommended` hint (Apps view only) is conditional on
     /// this.
     pub fn has_any_recommendation(&self) -> bool {
         !self.recommendations.is_empty()
@@ -333,12 +333,9 @@ pub enum Action {
     ToggleRecommended,
 }
 
-/// Plain `r` (no modifier) is reserved for `ToggleRecommended` rather than
-/// falling through to `Type('r')` — a deliberate trade-off matching the
-/// issue's request for a bare `r` key: typing a filter that contains a
-/// lowercase `r` (e.g. "firefox") will toggle the recommended-only view
-/// instead of adding the letter. Nothing else in the picker reserves a
-/// plain letter this way.
+/// `ToggleRecommended` lives on Ctrl-R, not plain `r`: the picker's filter
+/// box is a free-text box, and plain `r` must be typeable (e.g. "firefox")
+/// without triggering the toggle.
 pub fn map_key(key: KeyEvent) -> Option<Action> {
     match key.code {
         KeyCode::Down => Some(Action::Down),
@@ -349,7 +346,9 @@ pub fn map_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Esc => Some(Action::Cancel),
         KeyCode::Backspace => Some(Action::Backspace),
         KeyCode::Tab => Some(Action::ToggleView),
-        KeyCode::Char('r') if key.modifiers.is_empty() => Some(Action::ToggleRecommended),
+        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(Action::ToggleRecommended)
+        }
         KeyCode::Char(c) => Some(Action::Type(c)),
         _ => None,
     }
@@ -422,7 +421,7 @@ pub fn render(frame: &mut Frame, state: &PickerState, colors: bool) {
         });
     }
     if state.view() == View::Apps && state.has_any_recommendation() {
-        footer_text.push_str("  r: recommended");
+        footer_text.push_str("  ctrl-r recommended");
     }
     frame.render_widget(Paragraph::new(vec![Line::from(footer_text)]), chunks[2]);
 }
@@ -645,11 +644,20 @@ mod tests {
     }
 
     #[test]
-    fn test_map_key_plain_r_is_toggle_recommended() {
+    fn test_map_key_ctrl_r_is_toggle_recommended() {
         assert_eq!(
-            map_key(key(KeyCode::Char('r'))),
+            map_key(ctrl_key(KeyCode::Char('r'))),
             Some(Action::ToggleRecommended)
         );
+    }
+
+    // Regression: plain `r` used to toggle the recommended-only filter,
+    // which made it impossible to type "r" into the text filter (e.g. to
+    // search for "firefox"). Plain `r` must be ordinary filter text now;
+    // only Ctrl-R toggles the filter.
+    #[test]
+    fn test_map_key_plain_r_is_typed_not_toggle_recommended() {
+        assert_eq!(map_key(key(KeyCode::Char('r'))), Some(Action::Type('r')));
     }
 
     // --- apps view / toggle ---
@@ -752,6 +760,27 @@ mod tests {
         }
         assert_eq!(state.visible().len(), 1);
         assert_eq!(state.visible()[0].display_name, "GIMP");
+    }
+
+    // Regression: plain `r` used to toggle the recommended-only filter, so
+    // typing a filter containing "r" (e.g. "firefox") could never reach the
+    // text box. Dispatches through `map_key` exactly as the real key-handling
+    // loop does, to pin the whole path, not just the mapping.
+    #[test]
+    fn test_typing_r_narrows_text_filter_and_does_not_toggle_recommended_only() {
+        let mut state = PickerState::new(sample_items(), sample_apps());
+        match map_key(key(KeyCode::Char('r'))).unwrap() {
+            Action::Type(c) => state.push_char(c),
+            Action::ToggleRecommended => state.toggle_recommended_only(),
+            other => panic!("unexpected action for plain 'r': {other:?}"),
+        }
+        assert!(!state.recommended_only());
+        assert_eq!(state.visible().len(), 1);
+        assert_eq!(
+            state.visible()[0].display_name,
+            "Firefox",
+            "GIMP has no 'r' in its name, Firefox does"
+        );
     }
 
     // --- rendering ---
@@ -1199,22 +1228,22 @@ mod tests {
 
     #[test]
     fn test_render_hint_shown_only_in_apps_view_and_only_when_a_recommendation_exists() {
-        // Wide enough that the footer's combined "tab: ..." + "r: ..." hints
-        // aren't clipped (unlike most tests here, `draw`'s default 100 cols
-        // isn't quite enough once both hints are present).
+        // Wide enough that the footer's combined "tab: ..." + "ctrl-r ..."
+        // hints aren't clipped (unlike most tests here, `draw`'s default 100
+        // cols isn't quite enough once both hints are present).
         let (items, apps) = recommendation_fixture();
         let mut state = PickerState::new(items.clone(), apps.clone());
         assert!(
-            !full_text(&draw_sized(&state, 140, 24)).contains("r: recommended"),
+            !full_text(&draw_sized(&state, 140, 24)).contains("ctrl-r recommended"),
             "no recommendations set yet"
         );
 
         state.set_recommendations(recommendation_fixture_recs());
-        assert!(full_text(&draw_sized(&state, 140, 24)).contains("r: recommended"));
+        assert!(full_text(&draw_sized(&state, 140, 24)).contains("ctrl-r recommended"));
 
         state.toggle_view();
         assert!(
-            !full_text(&draw_sized(&state, 140, 24)).contains("r: recommended"),
+            !full_text(&draw_sized(&state, 140, 24)).contains("ctrl-r recommended"),
             "hint is Apps-view only"
         );
     }
