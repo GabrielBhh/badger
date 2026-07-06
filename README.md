@@ -94,6 +94,7 @@ Every key is optional — anything you don't set uses the default below.
 | `[snapshots]` | `manage` | `true` | Whether badger offers snapper snapshot cleanup at all |
 | `[optimize]` | `mirror_tool` | `"auto"` | Which mirror-ranking tool to use, or `"off"` to disable that task |
 | `[ui]` | `mascot` | `true` | Show the badger mascot in the TUI |
+| `[uninstall]` | `unused_days` | `90` | Age before an app's untouched cache/config dirs earn the "unused" hint in the Applications view |
 
 Command-line flags always win over the config file: `--dry-run`, `--json`,
 and `--debug` are global; run `badger --help` for the rest.

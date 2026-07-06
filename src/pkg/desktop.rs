@@ -17,6 +17,57 @@ pub struct DesktopApp {
     /// read from `X-Flatpak=` if present, else derived from the file's own
     /// name (flatpak exports one `<app-id>.desktop` per app).
     pub flatpak_id: Option<String>,
+    /// The first entry in `Categories=` that belongs to the fixed "main
+    /// category" set below, if any — feeds `pkg::recommend`'s category-
+    /// overlap hint. Categories outside the set (`GTK`, `Utility`, ...) are
+    /// skipped in favor of the next one.
+    pub main_category: Option<Category>,
+}
+
+/// The fixed set of `.desktop` `Categories=` entries `pkg::recommend` groups
+/// apps by for its overlap hint — deliberately small and user-facing rather
+/// than the full freedesktop category list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Category {
+    WebBrowser,
+    Email,
+    AudioVideo,
+    Audio,
+    Video,
+    TextEditor,
+    IDE,
+    FileManager,
+    TerminalEmulator,
+    Graphics,
+    Game,
+}
+
+impl Category {
+    fn parse(raw: &str) -> Option<Category> {
+        match raw {
+            "WebBrowser" => Some(Category::WebBrowser),
+            "Email" => Some(Category::Email),
+            "AudioVideo" => Some(Category::AudioVideo),
+            "Audio" => Some(Category::Audio),
+            "Video" => Some(Category::Video),
+            "TextEditor" => Some(Category::TextEditor),
+            "IDE" => Some(Category::IDE),
+            "FileManager" => Some(Category::FileManager),
+            "TerminalEmulator" => Some(Category::TerminalEmulator),
+            "Graphics" => Some(Category::Graphics),
+            "Game" => Some(Category::Game),
+            _ => None,
+        }
+    }
+}
+
+/// The first `;`-separated entry of a `Categories=` value that's in the
+/// fixed main-category set, in the file's own order — an unrecognized entry
+/// (e.g. `GTK`, `Utility`) is skipped rather than stopping the search.
+fn main_category(categories: &str) -> Option<Category> {
+    categories
+        .split(';')
+        .find_map(|c| Category::parse(c.trim()))
 }
 
 /// Scans every `.desktop` entry under the well-known application
@@ -73,6 +124,7 @@ fn parse_desktop_file(path: &Path, is_flatpak_export: bool) -> Option<DesktopApp
         display_name: entry.name?,
         desktop_file: path.to_path_buf(),
         flatpak_id,
+        main_category: entry.categories.as_deref().and_then(main_category),
     })
 }
 
@@ -82,13 +134,15 @@ struct ParsedEntry {
     no_display: bool,
     hidden: bool,
     x_flatpak: Option<String>,
+    categories: Option<String>,
 }
 
 /// Parses just the `[Desktop Entry]` section: plain `Name=` (localized
 /// `Name[xx]=` variants are a different key and so ignored), `NoDisplay=`,
-/// `Hidden=`, `X-Flatpak=`. Stops applying keys once a later `[...]` section
-/// header is seen. Returns `None` when the file never had a `[Desktop
-/// Entry]` section at all (malformed — skipped silently by the caller).
+/// `Hidden=`, `X-Flatpak=`, `Categories=`. Stops applying keys once a later
+/// `[...]` section header is seen. Returns `None` when the file never had a
+/// `[Desktop Entry]` section at all (malformed — skipped silently by the
+/// caller).
 fn parse_entry(text: &str) -> Option<ParsedEntry> {
     let mut entry = ParsedEntry::default();
     let mut in_section = false;
@@ -111,6 +165,7 @@ fn parse_entry(text: &str) -> Option<ParsedEntry> {
             "NoDisplay" => entry.no_display = value.trim().eq_ignore_ascii_case("true"),
             "Hidden" => entry.hidden = value.trim().eq_ignore_ascii_case("true"),
             "X-Flatpak" => entry.x_flatpak = Some(value.trim().to_string()),
+            "Categories" => entry.categories = Some(value.trim().to_string()),
             _ => {}
         }
     }
@@ -291,5 +346,59 @@ mod tests {
         write_desktop(&dir, "broken.desktop", "not an ini file at all\n");
 
         assert!(scan(&f.ctx).is_empty());
+    }
+
+    // --- Categories= / main_category ---
+
+    #[test]
+    fn test_scan_parses_a_recognized_category() {
+        let f = fixture();
+        let dir = f.ctx.root.join("usr/share/applications");
+        write_desktop(
+            &dir,
+            "firefox.desktop",
+            "[Desktop Entry]\nName=Firefox\nCategories=Network;WebBrowser;\n",
+        );
+
+        let apps = scan(&f.ctx);
+        assert_eq!(apps[0].main_category, Some(Category::WebBrowser));
+    }
+
+    #[test]
+    fn test_scan_picks_the_first_recognized_category_skipping_unknown_ones() {
+        let f = fixture();
+        let dir = f.ctx.root.join("usr/share/applications");
+        write_desktop(
+            &dir,
+            "app.desktop",
+            "[Desktop Entry]\nName=App\nCategories=GTK;Utility;Video;AudioVideo;\n",
+        );
+
+        let apps = scan(&f.ctx);
+        assert_eq!(apps[0].main_category, Some(Category::Video));
+    }
+
+    #[test]
+    fn test_scan_no_categories_line_yields_no_main_category() {
+        let f = fixture();
+        let dir = f.ctx.root.join("usr/share/applications");
+        write_desktop(&dir, "app.desktop", "[Desktop Entry]\nName=App\n");
+
+        let apps = scan(&f.ctx);
+        assert_eq!(apps[0].main_category, None);
+    }
+
+    #[test]
+    fn test_scan_categories_with_no_recognized_entries_yields_no_main_category() {
+        let f = fixture();
+        let dir = f.ctx.root.join("usr/share/applications");
+        write_desktop(
+            &dir,
+            "app.desktop",
+            "[Desktop Entry]\nName=App\nCategories=GTK;Utility;\n",
+        );
+
+        let apps = scan(&f.ctx);
+        assert_eq!(apps[0].main_category, None);
     }
 }

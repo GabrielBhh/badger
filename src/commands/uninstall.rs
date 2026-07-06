@@ -59,8 +59,19 @@ fn run_interactive(
     eprintln!("Reading applications...");
     let apps = crate::pkg::applications(ctx, &packages);
 
+    eprintln!("Checking for unused and duplicate apps...");
+    let desktop_apps = crate::pkg::desktop::scan(ctx);
+    let recommendations =
+        crate::pkg::recommend::recommendations(&apps, &packages, &desktop_apps, ctx, &ctx.config);
+
     let mut terminal = tui::init_terminal()?;
-    let pick_result = drive_picker(&mut terminal, packages, apps, packages_first);
+    let pick_result = drive_picker(
+        &mut terminal,
+        packages,
+        apps,
+        recommendations,
+        packages_first,
+    );
     let package = match pick_result {
         Ok(Some(package)) => package,
         Ok(None) => {
@@ -322,6 +333,7 @@ fn drive_picker(
     terminal: &mut tui::Term,
     items: Vec<InstalledPackage>,
     apps: Vec<crate::pkg::AppEntry>,
+    recommendations: Vec<crate::pkg::recommend::Recommendation>,
     packages_first: bool,
 ) -> anyhow::Result<Option<InstalledPackage>> {
     let mut state = if packages_first {
@@ -329,6 +341,7 @@ fn drive_picker(
     } else {
         picker::PickerState::new(items, apps)
     };
+    state.set_recommendations(recommendations);
     let colors = tui::colors_enabled_now();
     loop {
         let height = terminal.size()?.height;
@@ -348,6 +361,7 @@ fn drive_picker(
             Some(picker::Action::Type(c)) => state.push_char(c),
             Some(picker::Action::Backspace) => state.backspace(),
             Some(picker::Action::ToggleView) => state.toggle_view(),
+            Some(picker::Action::ToggleRecommended) => state.toggle_recommended_only(),
             Some(picker::Action::Cancel) => return Ok(None),
             Some(picker::Action::Select) => {
                 if let Some(package) = state.selected() {
