@@ -106,8 +106,9 @@ pub fn scan(
 
 /// The package name as-is, plus its lowercased form if that differs — many
 /// packages install per-app directories lowercased even when the package
-/// name itself has mixed case.
-fn name_variants(name: &str) -> Vec<String> {
+/// name itself has mixed case. `pub(crate)` so `pkg::recommend`'s unused-app
+/// heuristic can reuse the exact same variants rather than re-deriving them.
+pub(crate) fn name_variants(name: &str) -> Vec<String> {
     let lower = name.to_lowercase();
     if lower == name {
         vec![name.to_string()]

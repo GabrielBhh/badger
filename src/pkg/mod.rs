@@ -7,6 +7,7 @@
 pub mod desktop;
 pub mod flatpak;
 pub mod pacman;
+pub mod recommend;
 pub mod snap;
 
 use std::collections::HashMap;

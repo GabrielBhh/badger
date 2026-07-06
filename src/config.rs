@@ -11,6 +11,7 @@ pub struct Config {
     pub snapshots: Snapshots,
     pub optimize: Optimize,
     pub ui: Ui,
+    pub uninstall: Uninstall,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -94,6 +95,21 @@ impl Default for Ui {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Uninstall {
+    /// How old (by mtime) an app's `~/.cache/<name>` and `~/.config/<name>`
+    /// must be — with none touched more recently — before the uninstall
+    /// picker's Applications view hints it as possibly unused.
+    pub unused_days: u32,
+}
+
+impl Default for Uninstall {
+    fn default() -> Self {
+        Uninstall { unused_days: 90 }
+    }
+}
+
 pub fn load_from_str(s: &str) -> anyhow::Result<Config> {
     toml::from_str(s).context("failed to parse config")
 }
@@ -133,6 +149,13 @@ mod tests {
         assert_eq!(Clean::default().orphan_min_age_days, 180);
         let cfg = load_from_str("[clean]\norphan_min_age_days = 10\n").unwrap();
         assert_eq!(cfg.clean.orphan_min_age_days, 10);
+    }
+
+    #[test]
+    fn test_unused_days_defaults_and_can_be_overridden() {
+        assert_eq!(Uninstall::default().unused_days, 90);
+        let cfg = load_from_str("[uninstall]\nunused_days = 30\n").unwrap();
+        assert_eq!(cfg.uninstall.unused_days, 30);
     }
 
     #[test]
