@@ -681,4 +681,37 @@ mod tests {
         assert!(text.contains("all packages"));
         assert!(text.contains("tab: applications"));
     }
+
+    // Threat: a hostile `.desktop` file's `Name=` is attacker-controlled and
+    // ends up directly in a picker row (terminal-injection / spoofing via raw
+    // ESC bytes, ANSI color sequences, or bidi override characters). Nothing
+    // in badger sanitizes it before rendering — the protection comes entirely
+    // from ratatui's `Buffer::set_stringn`, which strips control and
+    // zero-width graphemes when writing cells. This test pins that upstream
+    // behavior: if a future hand-rolled truncation/rendering path replaced
+    // `set_stringn`'s use and dropped the filtering, this would catch it.
+    #[test]
+    fn test_render_filters_hostile_desktop_name_control_and_bidi_chars() {
+        let hostile_prefix = "PWNED\x1b[31m\x1b\u{202E}";
+        let mut hostile_name = hostile_prefix.to_string();
+        while hostile_name.chars().count() < 500 {
+            hostile_name.push('A');
+        }
+        let items = vec![package("evil-pkg", "1.0-1", Backend::Pacman, false)];
+        let apps = vec![AppEntry {
+            display_name: hostile_name,
+            package_index: 0,
+        }];
+        let state = PickerState::new(items, apps);
+
+        let buffer = draw(&state);
+        let text = full_text(&buffer);
+
+        assert!(!text.contains('\x1b'), "raw ESC byte must not render");
+        assert!(!text.contains('\u{202E}'), "bidi override must not render");
+        assert!(
+            text.contains("PWNED"),
+            "leading printable prefix must still show"
+        );
+    }
 }
