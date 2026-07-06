@@ -47,8 +47,11 @@ fn run_interactive(ctx: &Ctx, dry_run_flag: bool) -> anyhow::Result<UninstallOut
         });
     }
 
+    eprintln!("reading applications…");
+    let apps = crate::pkg::applications(ctx, &packages);
+
     let mut terminal = tui::init_terminal()?;
-    let pick_result = drive_picker(&mut terminal, packages);
+    let pick_result = drive_picker(&mut terminal, packages, apps);
     let package = match pick_result {
         Ok(Some(package)) => package,
         Ok(None) => {
@@ -303,10 +306,9 @@ fn remove_argv_for(package: &InstalledPackage) -> (Vec<String>, bool) {
 fn drive_picker(
     terminal: &mut tui::Term,
     items: Vec<InstalledPackage>,
+    apps: Vec<crate::pkg::AppEntry>,
 ) -> anyhow::Result<Option<InstalledPackage>> {
-    // Slice 4 wires the real Applications view in via `crate::pkg::applications`;
-    // this slice only adds the toggling machinery to `PickerState` itself.
-    let mut state = picker::PickerState::new(items, Vec::new());
+    let mut state = picker::PickerState::new(items, apps);
     let colors = tui::colors_enabled_now();
     loop {
         terminal.draw(|f| picker::render(f, &state, colors))?;
