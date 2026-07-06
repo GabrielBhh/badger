@@ -10,7 +10,7 @@ use std::io::IsTerminal;
 
 use crossterm::event::{Event, KeyEventKind};
 
-use crate::commands::shared::{drive_selection, execution_notes};
+use crate::commands::shared::{drive_selection, summarize_run};
 use crate::core::exec::{DryRunEffector, Effector, RealEffector, Summary};
 use crate::core::item::Group;
 use crate::core::runner::RealRunner;
@@ -238,7 +238,8 @@ fn render_after_removal_and_leftovers(
         }
     }
 
-    for note in execution_notes(journal, run_id)? {
+    let (_, _, notes) = summarize_run(journal, run_id)?;
+    for note in notes {
         rendered.push_str(&format!("\n  {note}"));
     }
 

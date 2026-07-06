@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use crate::commands::shared::{JsonOutput, drive_selection, execution_notes};
+use crate::commands::shared::{JsonOutput, count_label, drive_selection, summarize_run};
 use crate::core::exec::{DryRunEffector, Effector, RealEffector, Summary};
 use crate::core::item::Group;
 use crate::core::runner::RealRunner;
@@ -79,16 +79,29 @@ pub fn run(ctx: &Ctx, yes: bool, dry_run_flag: bool, mode: Mode) -> anyhow::Resu
         eprintln!("warning: {warning}");
     }
 
+    let (ran, skipped, notes) = if will_execute {
+        summarize_run(&journal, &run_id)?
+    } else {
+        (0, 0, Vec::new())
+    };
+
     let mut rendered = match mode {
         Mode::Json => serde_json::to_string(&JsonOutput {
             groups: &groups,
             summary: summary.as_ref(),
             dry_run: is_dry_run,
         })?,
-        Mode::Human => render_human(&groups, summary.as_ref(), will_execute, is_dry_run),
+        Mode::Human => render_human(
+            &groups,
+            summary.as_ref(),
+            will_execute,
+            is_dry_run,
+            ran,
+            skipped,
+        ),
     };
     if will_execute && mode == Mode::Human {
-        for note in execution_notes(&journal, &run_id)? {
+        for note in notes {
             rendered.push_str(&format!("\n  {note}"));
         }
     }
@@ -172,16 +185,26 @@ fn render_after_selection(
         eprintln!("warning: {warning}");
     }
 
+    let (ran, skipped, notes) = summarize_run(journal, &run_id)?;
     let mut out = if dry_run {
         format!(
-            "Would free {} — dry run — nothing deleted (recorded in history).",
-            humanize_bytes(summary.bytes_freed)
+            "Would free {} · {} · dry run — nothing deleted (recorded in history)",
+            humanize_bytes(summary.bytes_freed),
+            count_label(ran, "item")
         )
     } else {
-        format!("Freed {}.", humanize_bytes(summary.bytes_freed))
+        let mut line = format!(
+            "Freed {} · {}",
+            humanize_bytes(summary.bytes_freed),
+            count_label(ran, "item")
+        );
+        if skipped > 0 {
+            line.push_str(&format!(" · {skipped} skipped"));
+        }
+        line
     };
 
-    for note in execution_notes(journal, &run_id)? {
+    for note in notes {
         out.push_str(&format!("\n  {note}"));
     }
 
@@ -267,6 +290,8 @@ fn render_human(
     summary: Option<&Summary>,
     will_execute: bool,
     is_dry_run: bool,
+    ran: usize,
+    skipped: usize,
 ) -> String {
     let mut out = render_plan(groups);
     if out == "Nothing to purge." {
@@ -274,13 +299,20 @@ fn render_human(
     }
     match summary {
         Some(summary) if is_dry_run => out.push_str(&format!(
-            "\n\nWould free {} (dry run — nothing was deleted; recorded in history).",
-            humanize_bytes(summary.bytes_freed)
+            "\n\nWould free {} · {} · dry run — nothing deleted (recorded in history)",
+            humanize_bytes(summary.bytes_freed),
+            count_label(ran, "item")
         )),
-        Some(summary) => out.push_str(&format!(
-            "\n\nFreed {}.",
-            humanize_bytes(summary.bytes_freed)
-        )),
+        Some(summary) => {
+            out.push_str(&format!(
+                "\n\nFreed {} · {}",
+                humanize_bytes(summary.bytes_freed),
+                count_label(ran, "item")
+            ));
+            if skipped > 0 {
+                out.push_str(&format!(" · {skipped} skipped"));
+            }
+        }
         None if !will_execute => {
             out.push_str("\n\nRun with --dry-run for a journaled preview, or --yes to purge.")
         }
@@ -490,7 +522,7 @@ mod tests {
 
         let output = render_after_selection(&groups, &selection, &f.ctx, &journal, false).unwrap();
 
-        assert_eq!(output.rendered, "Freed 4.0 KiB.");
+        assert_eq!(output.rendered, "Freed 4.0 KiB · 1 item");
         assert!(!dir.exists());
     }
 }

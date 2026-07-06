@@ -1,8 +1,8 @@
 //! Helpers shared by every interactive top-level command (`clean`, `purge`,
 //! ...): driving the checklist/confirm TUI loop against a scan's groups, and
-//! reading back a run's journal for execution-time notes. Both are already
-//! generic over `Group`/`Journal` with no `Rule`/`Action` awareness, so they
-//! don't belong to any one command.
+//! reading back a run's journal for execution-time counts and notes. Both are
+//! already generic over `Group`/`Journal` with no `Rule`/`Action` awareness,
+//! so they don't belong to any one command.
 
 use std::collections::HashSet;
 
@@ -79,20 +79,39 @@ pub(crate) fn drive_selection(
     }
 }
 
-/// Reads back the journal for `run_id` and formats "note: <rule> —
-/// <outcome>" lines for skipped/error/refused outcomes recorded during
-/// execution — so a TOCTOU refusal or a privileged-helper error never
-/// silently just shrinks the "Freed" total.
-pub(crate) fn execution_notes(journal: &Journal, run_id: &str) -> anyhow::Result<Vec<String>> {
+/// Reads this run's journal records once and classifies all of them: how
+/// many actually ran (or, in a dry run, would have), how many were skipped
+/// (sudo in a sandbox), and "note: <rule> — <outcome>" lines for the
+/// skipped/error/refused ones — so a TOCTOU refusal or a privileged-helper
+/// error never silently just shrinks the "Freed"/"Ran" total.
+pub(crate) fn summarize_run(
+    journal: &Journal,
+    run_id: &str,
+) -> anyhow::Result<(usize, usize, Vec<String>)> {
     let (records, _) = journal.read_all()?;
-    Ok(records
-        .iter()
-        .filter(|r| r.run_id == run_id)
-        .filter(|r| {
-            r.outcome.starts_with("skipped")
-                || r.outcome.starts_with("error")
-                || r.outcome.starts_with("refused")
-        })
-        .map(|r| format!("note: {} — {}", r.rule, r.outcome))
-        .collect())
+    let mut ran = 0;
+    let mut skipped = 0;
+    let mut notes = Vec::new();
+    for record in records.iter().filter(|r| r.run_id == run_id) {
+        if record.outcome.starts_with("skipped") {
+            skipped += 1;
+            notes.push(format!("note: {} — {}", record.rule, record.outcome));
+        } else if record.outcome.starts_with("error") || record.outcome.starts_with("refused") {
+            notes.push(format!("note: {} — {}", record.rule, record.outcome));
+        } else {
+            ran += 1;
+        }
+    }
+    Ok((ran, skipped, notes))
+}
+
+/// Pluralizes a count for the execution summaries below: `1 item` / `2
+/// items`, `1 task` / `2 tasks`. Every unit used here pluralizes by simply
+/// appending `s`.
+pub(crate) fn count_label(n: usize, unit: &str) -> String {
+    if n == 1 {
+        format!("1 {unit}")
+    } else {
+        format!("{n} {unit}s")
+    }
 }
