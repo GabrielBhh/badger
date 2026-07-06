@@ -65,6 +65,7 @@ pub(crate) fn drive_selection(
             Some(checklist::Action::Up) => state.move_up(),
             Some(checklist::Action::Toggle) => state.toggle(),
             Some(checklist::Action::ToggleGroup) => state.toggle_group(),
+            Some(checklist::Action::ToggleAll) => state.toggle_all(),
             Some(checklist::Action::Top) => state.top(),
             Some(checklist::Action::Bottom) => state.bottom(),
             Some(checklist::Action::Cancel) => return Ok(None),
