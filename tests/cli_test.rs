@@ -165,3 +165,20 @@ fn test_help_lists_visible_subcommands_but_not_helper() {
     assert!(!help.contains("__helper"));
     assert!(!help.contains("__mangen"));
 }
+
+#[test]
+fn test_version_is_0_9_0() {
+    let version = Cli::command().render_version();
+    assert!(version.contains("0.9.0"), "got: {version}");
+}
+
+#[test]
+fn test_long_help_has_description_and_docs_footer() {
+    let help = Cli::command().render_long_help().to_string();
+    assert!(help.contains("safety-first"), "got: {help}");
+    assert!(help.contains("docs/RULES.md"), "got: {help}");
+    assert!(
+        help.contains("https://github.com/GabrielBhh/badger"),
+        "got: {help}"
+    );
+}
