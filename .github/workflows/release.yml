@@ -39,7 +39,10 @@ jobs:
         run: cross build --release --locked --target ${{ matrix.target }}
       - name: Build native binary to generate completions and man pages
         # The aarch64 binary can't run on the x86_64 runner, so completions
-        # and man pages come from a native build of the same commit.
+        # and man pages come from a native build of the same commit. Not
+        # needed on the x86_64 leg: the musl binary just built is static and
+        # already runs fine on this runner.
+        if: matrix.target != 'x86_64-unknown-linux-musl'
         run: cargo build --release --locked
       - name: Assemble tarball
         run: |
@@ -48,10 +51,15 @@ jobs:
           mkdir -p "$STAGE/completions" "$STAGE/man"
           cp "target/${{ matrix.target }}/release/badger" "$STAGE/badger"
           cp LICENSE README.md "$STAGE/"
-          ./target/release/badger completion bash > "$STAGE/completions/badger.bash"
-          ./target/release/badger completion zsh > "$STAGE/completions/_badger"
-          ./target/release/badger completion fish > "$STAGE/completions/badger.fish"
-          ./target/release/badger __mangen "$STAGE/man"
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
+            GEN_BIN="target/${{ matrix.target }}/release/badger"
+          else
+            GEN_BIN="target/release/badger"
+          fi
+          "$GEN_BIN" completion bash > "$STAGE/completions/badger.bash"
+          "$GEN_BIN" completion zsh > "$STAGE/completions/_badger"
+          "$GEN_BIN" completion fish > "$STAGE/completions/badger.fish"
+          "$GEN_BIN" __mangen "$STAGE/man"
           tar -czf "$STAGE.tar.gz" "$STAGE"
           sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
       - uses: actions/upload-artifact@v4
