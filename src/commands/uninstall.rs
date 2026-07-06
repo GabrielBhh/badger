@@ -325,6 +325,8 @@ fn drive_picker(
     };
     let colors = tui::colors_enabled_now();
     loop {
+        let height = terminal.size()?.height;
+        state.scroll_into_view(picker::body_height(height));
         terminal.draw(|f| picker::render(f, &state, colors))?;
 
         let Event::Key(key) = crossterm::event::read()? else {
