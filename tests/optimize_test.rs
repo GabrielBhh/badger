@@ -144,7 +144,7 @@ fn test_yes_runs_only_prechecked_tasks_with_exact_argv_and_skips_opt_ins() {
     ]));
 
     let output = optimize::run(&f.ctx, true, false, Mode::Human).unwrap();
-    assert!(output.rendered.contains("Ran "));
+    assert!(output.rendered.contains("Ran 5 tasks · 3 skipped"));
 
     let journal = Journal::new(&f.ctx.state_dir);
     let (records, _) = journal.read_all().unwrap();

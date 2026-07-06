@@ -91,6 +91,7 @@ fn test_yes_deletes_pre_checked_candidate_and_journals_real_run() {
     let output = purge::run(&f.ctx, true, false, Mode::Human).unwrap();
 
     assert!(output.rendered.contains("Freed 4.0 KiB"));
+    assert!(output.rendered.contains("· 1 item"));
     assert!(!dir.exists(), "--yes must actually delete the candidate");
 
     let journal = badger::safety::journal::Journal::new(&f.ctx.state_dir);

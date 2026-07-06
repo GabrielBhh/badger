@@ -1011,7 +1011,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(summary.actions, 1);
-        let notes = crate::commands::shared::execution_notes(&journal, "run-1").unwrap();
+        let (_, _, notes) = crate::commands::shared::summarize_run(&journal, "run-1").unwrap();
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("skipped:"));
     }
@@ -1065,7 +1065,7 @@ mod tests {
                 .iter()
                 .any(|r| r.outcome == "skipped: sudo is never run in a sandbox")
         );
-        let notes = crate::commands::shared::execution_notes(&journal, "run-1").unwrap();
+        let (_, _, notes) = crate::commands::shared::summarize_run(&journal, "run-1").unwrap();
         assert_eq!(notes.len(), 2);
     }
 }

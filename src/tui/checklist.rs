@@ -186,6 +186,37 @@ impl ChecklistState {
         }
     }
 
+    /// Toggles every non-whitelisted candidate in a non-Risky group, across
+    /// all groups: if all of them are currently selected, deselects them
+    /// all; otherwise selects them all. Risky-tier candidates are never
+    /// touched — they require the separate typed-confirm opt-in.
+    pub fn toggle_all(&mut self) {
+        let target: Vec<(usize, usize)> = self
+            .groups
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| g.risk != Risk::Risky)
+            .flat_map(|(gi, g)| {
+                g.candidates
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| !c.whitelisted)
+                    .map(move |(ci, _)| (gi, ci))
+            })
+            .collect();
+        if target.is_empty() {
+            return;
+        }
+        let all_selected = target.iter().all(|pos| self.selected.contains(pos));
+        for pos in target {
+            if all_selected {
+                self.selected.remove(&pos);
+            } else {
+                self.selected.insert(pos);
+            }
+        }
+    }
+
     fn cursor_row_index(&self) -> Option<usize> {
         let (gi, ci) = self.cursor()?;
         self.rows.iter().position(|r| *r == Row::Candidate(gi, ci))
@@ -232,6 +263,7 @@ pub enum Action {
     Up,
     Toggle,
     ToggleGroup,
+    ToggleAll,
     Top,
     Bottom,
     Confirm,
@@ -243,9 +275,10 @@ pub fn map_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('j') | KeyCode::Down => Some(Action::Down),
         KeyCode::Char('k') | KeyCode::Up => Some(Action::Up),
         KeyCode::Char(' ') => Some(Action::Toggle),
-        KeyCode::Char('a') => Some(Action::ToggleGroup),
-        KeyCode::Char('g') => Some(Action::Top),
-        KeyCode::Char('G') => Some(Action::Bottom),
+        KeyCode::Char('a') => Some(Action::ToggleAll),
+        KeyCode::Char('g') => Some(Action::ToggleGroup),
+        KeyCode::Home => Some(Action::Top),
+        KeyCode::End => Some(Action::Bottom),
         KeyCode::Enter => Some(Action::Confirm),
         KeyCode::Char('q') | KeyCode::Esc => Some(Action::Cancel),
         _ => None,
@@ -262,19 +295,19 @@ pub fn render(frame: &mut Frame, state: &ChecklistState, colors: bool) {
         .constraints([
             Constraint::Length(2),
             Constraint::Min(1),
-            Constraint::Length(3),
+            Constraint::Length(2),
         ])
         .split(frame.area());
 
     render_header(frame, chunks[0], state);
     render_body(frame, chunks[1], state, colors);
-    render_footer(frame, chunks[2], state);
+    render_footer(frame, chunks[2], state, colors);
 }
 
 /// Body area height a caller should pass to `scroll_into_view` for a frame
 /// of total height `frame_height` (accounting for the fixed header/footer).
 pub fn body_height(frame_height: u16) -> usize {
-    frame_height.saturating_sub(5) as usize
+    frame_height.saturating_sub(4) as usize
 }
 
 fn render_header(frame: &mut Frame, area: Rect, state: &ChecklistState) {
@@ -349,14 +382,65 @@ fn render_row(state: &ChecklistState, row: Row, colors: bool) -> Line<'static> {
     }
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, state: &ChecklistState) {
+fn render_footer(frame: &mut Frame, area: Rect, state: &ChecklistState, colors: bool) {
     let total = humanize_bytes(state.total_selected_bytes());
     let count = state.total_selected_count();
-    let lines = vec![
-        Line::from(format!("Selected: {count} item(s), {total}")),
-        Line::from("j/k move  space toggle  a toggle group"),
-        Line::from("g/G top/bottom  enter proceed  q/esc cancel"),
-    ];
+    let recent = state
+        .groups
+        .iter()
+        .flat_map(|g| g.candidates.iter())
+        .filter(|c| c.label.contains(" (recent)"))
+        .count();
+    let whitelisted = state
+        .groups
+        .iter()
+        .flat_map(|g| g.candidates.iter())
+        .filter(|c| c.whitelisted)
+        .count();
+    let risky = state
+        .groups
+        .iter()
+        .filter(|g| g.risk == Risk::Risky)
+        .map(|g| g.candidates.len())
+        .sum::<usize>();
+
+    let mut status = format!("{count} selected · {total}");
+    // Risky note first: the footer line clips (no wrap) on narrow terminals,
+    // and the safety-relevant note must survive truncation.
+    if risky > 0 {
+        status.push_str(&format!(" · {risky} risky need typed confirm"));
+    }
+    if recent > 0 {
+        status.push_str(&format!(" · {recent} recent excluded — space includes"));
+    }
+    if whitelisted > 0 {
+        status.push_str(&format!(" · {whitelisted} whitelisted (locked)"));
+    }
+
+    let key_style = if colors {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+    let sep = Span::raw(" · ");
+    let hints = Line::from(vec![
+        Span::styled("space", key_style),
+        Span::raw(" toggle"),
+        sep.clone(),
+        Span::styled("a", key_style),
+        Span::raw(" all"),
+        sep.clone(),
+        Span::styled("g", key_style),
+        Span::raw(" group"),
+        sep.clone(),
+        Span::styled("enter", key_style),
+        Span::raw(" continue"),
+        sep,
+        Span::styled("q", key_style),
+        Span::raw(" quit"),
+    ]);
+
+    let lines = vec![Line::from(status), hints];
     frame.render_widget(Paragraph::new(lines), area);
 }
 
@@ -579,6 +663,64 @@ mod tests {
         assert!(state.is_selected(1, 0));
     }
 
+    #[test]
+    fn test_toggle_all_selects_every_safe_and_moderate_non_whitelisted_candidate() {
+        let mut state = ChecklistState::new(sample_groups());
+        state.toggle_all();
+        assert!(state.is_selected(0, 0));
+        assert!(state.is_selected(1, 0), "moderate must be included");
+    }
+
+    #[test]
+    fn test_toggle_all_never_touches_risky_candidates() {
+        let mut state = ChecklistState::new(sample_groups());
+        assert!(!state.is_selected(2, 0));
+        state.toggle_all();
+        assert!(
+            !state.is_selected(2, 0),
+            "risky must never be auto-selected"
+        );
+    }
+
+    #[test]
+    fn test_toggle_all_excludes_whitelisted_candidates() {
+        let mut state = ChecklistState::new(sample_groups());
+        state.toggle_all();
+        assert!(!state.is_selected(0, 1), "whitelisted stays excluded");
+    }
+
+    #[test]
+    fn test_toggle_all_deselects_when_target_set_is_fully_selected() {
+        let mut state = ChecklistState::new(sample_groups());
+        state.toggle_all(); // select every safe/moderate candidate
+        assert!(state.is_selected(0, 0));
+        assert!(state.is_selected(1, 0));
+        state.toggle_all(); // fully selected -> deselect
+        assert!(!state.is_selected(0, 0));
+        assert!(!state.is_selected(1, 0));
+    }
+
+    #[test]
+    fn test_toggle_all_is_noop_when_target_set_is_empty() {
+        let mut state = ChecklistState::new(vec![
+            group(
+                "Risky thing",
+                Risk::Risky,
+                vec![candidate("/risky/path", 8192, Risk::Risky)],
+                vec![],
+            ),
+            group(
+                "Whitelisted only",
+                Risk::Safe,
+                vec![whitelisted(candidate("~/.cache/c", 512, Risk::Safe))],
+                vec![],
+            ),
+        ]);
+        assert_eq!(state.total_selected_count(), 0);
+        state.toggle_all();
+        assert_eq!(state.total_selected_count(), 0);
+    }
+
     // --- totals ---
 
     #[test]
@@ -630,9 +772,10 @@ mod tests {
         assert_eq!(map_key(key(KeyCode::Char('k'))), Some(Action::Up));
         assert_eq!(map_key(key(KeyCode::Up)), Some(Action::Up));
         assert_eq!(map_key(key(KeyCode::Char(' '))), Some(Action::Toggle));
-        assert_eq!(map_key(key(KeyCode::Char('a'))), Some(Action::ToggleGroup));
-        assert_eq!(map_key(key(KeyCode::Char('g'))), Some(Action::Top));
-        assert_eq!(map_key(key(KeyCode::Char('G'))), Some(Action::Bottom));
+        assert_eq!(map_key(key(KeyCode::Char('a'))), Some(Action::ToggleAll));
+        assert_eq!(map_key(key(KeyCode::Char('g'))), Some(Action::ToggleGroup));
+        assert_eq!(map_key(key(KeyCode::Home)), Some(Action::Top));
+        assert_eq!(map_key(key(KeyCode::End)), Some(Action::Bottom));
         assert_eq!(map_key(key(KeyCode::Enter)), Some(Action::Confirm));
         assert_eq!(map_key(key(KeyCode::Char('q'))), Some(Action::Cancel));
         assert_eq!(map_key(key(KeyCode::Esc)), Some(Action::Cancel));
@@ -713,7 +856,15 @@ mod tests {
     fn test_render_footer_shows_total_selected_size() {
         let state = ChecklistState::new(sample_groups());
         let buffer = draw(&state, true);
-        assert!(full_text(&buffer).contains("Selected: 1 item(s), 1.0 KiB"));
+        assert!(full_text(&buffer).contains("1 selected · 1.0 KiB"));
+    }
+
+    #[test]
+    fn test_render_footer_selected_size_updates_live_after_toggle() {
+        let mut state = ChecklistState::new(sample_groups());
+        state.toggle(); // deselect the only default-selected candidate
+        let buffer = draw(&state, true);
+        assert!(full_text(&buffer).contains("0 selected · 0 B"));
     }
 
     #[test]
@@ -721,9 +872,74 @@ mod tests {
         let state = ChecklistState::new(sample_groups());
         let buffer = draw(&state, true);
         let text = full_text(&buffer);
-        assert!(text.contains("space toggle"));
-        assert!(text.contains("enter proceed"));
-        assert!(text.contains("q/esc cancel"));
+        assert!(text.contains("space toggle · a all · g group · enter continue · q quit"));
+    }
+
+    #[test]
+    fn test_render_footer_key_hint_is_colored_when_colors_enabled() {
+        let state = ChecklistState::new(sample_groups());
+        let buffer = draw(&state, true);
+        let y = (0..buffer.area.height)
+            .find(|&y| row_text(&buffer, y).contains("space toggle"))
+            .unwrap();
+        let x = row_text(&buffer, y).find("space").unwrap() as u16;
+        assert_eq!(buffer.cell((x, y)).unwrap().fg, Color::Cyan);
+    }
+
+    #[test]
+    fn test_render_footer_key_hint_is_plain_without_colors() {
+        let state = ChecklistState::new(sample_groups());
+        let buffer = draw(&state, false);
+        let y = (0..buffer.area.height)
+            .find(|&y| row_text(&buffer, y).contains("space toggle"))
+            .unwrap();
+        let x = row_text(&buffer, y).find("space").unwrap() as u16;
+        assert_eq!(buffer.cell((x, y)).unwrap().fg, Color::Reset);
+    }
+
+    #[test]
+    fn test_render_footer_notes_absent_when_no_recent_whitelisted_or_risky() {
+        let state = ChecklistState::new(vec![group(
+            "User caches",
+            Risk::Safe,
+            vec![candidate("~/.cache/a", 1024, Risk::Safe)],
+            vec![],
+        )]);
+        let buffer = draw(&state, true);
+        let text = full_text(&buffer);
+        assert!(!text.contains("recent excluded"));
+        assert!(!text.contains("whitelisted (locked)"));
+        assert!(!text.contains("risky need typed confirm"));
+    }
+
+    #[test]
+    fn test_render_footer_shows_recent_excluded_note() {
+        let state = ChecklistState::new(vec![group(
+            "User caches",
+            Risk::Safe,
+            vec![candidate("~/.cache/a (recent)", 1024, Risk::Safe)],
+            vec![],
+        )]);
+        let buffer = draw(&state, true);
+        assert!(
+            full_text(&buffer).contains("1 recent excluded — space includes"),
+            "{}",
+            full_text(&buffer)
+        );
+    }
+
+    #[test]
+    fn test_render_footer_shows_whitelisted_note() {
+        let state = ChecklistState::new(sample_groups());
+        let buffer = draw(&state, true);
+        assert!(full_text(&buffer).contains("1 whitelisted (locked)"));
+    }
+
+    #[test]
+    fn test_render_footer_shows_risky_note() {
+        let state = ChecklistState::new(sample_groups());
+        let buffer = draw(&state, true);
+        assert!(full_text(&buffer).contains("1 risky need typed confirm"));
     }
 
     #[test]

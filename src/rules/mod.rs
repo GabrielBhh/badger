@@ -97,7 +97,7 @@ pub enum Action {
     /// Like `CmdSelected`, but the builder may also refuse part of the
     /// selection: each returned `(label, reason)` skip is journaled as a
     /// `skipped: <label> — <reason>` outcome (surfacing in the run's notes
-    /// via `execution_notes`) instead of running anything for it.
+    /// via `summarize_run`) instead of running anything for it.
     CmdSelectedWithSkips(fn(&Ctx, &Config, &[Candidate]) -> CmdSelectedWithSkipsResult),
 }
 

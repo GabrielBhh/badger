@@ -1432,7 +1432,7 @@ mod tests {
         assert!(records[1].outcome.contains("bad"));
         assert!(records[1].sudo);
 
-        let notes = crate::commands::shared::execution_notes(&journal, "run-1").unwrap();
+        let (_, _, notes) = crate::commands::shared::summarize_run(&journal, "run-1").unwrap();
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("skipped:"));
     }

@@ -22,7 +22,7 @@ use badger::ctx::Ctx;
 use badger::rules;
 use badger::safety::whitelist;
 use badger::tui::checklist::{self, ChecklistState};
-use badger::tui::confirm::{ConfirmState, Outcome, handle_key};
+use badger::tui::confirm::{ConfirmState, Outcome, Verb, handle_key};
 
 struct Fixture {
     _sandbox: tempfile::TempDir,
@@ -147,7 +147,7 @@ fn test_selecting_the_one_risky_snapshot_candidate_requires_typed_count_confirma
     assert!(checklist.is_selected(manual_idx, 0));
 
     // First real-rule trigger of the Risky typed-count confirmation path.
-    let mut confirm = ConfirmState::from_checklist(&checklist);
+    let mut confirm = ConfirmState::from_checklist(&checklist, Verb::Delete, false);
     assert!(confirm.requires_typed_confirmation());
     assert_eq!(confirm.risky_required_count(), 1);
 

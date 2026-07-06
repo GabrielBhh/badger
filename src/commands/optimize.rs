@@ -9,13 +9,13 @@
 use std::collections::HashSet;
 use std::io::IsTerminal;
 
-use crate::commands::shared::{JsonOutput, drive_selection};
+use crate::commands::shared::{JsonOutput, drive_selection, summarize_run};
 use crate::core::exec::{DryRunEffector, RealEffector, execute, execute_selected};
 use crate::core::item::{Group, Risk};
 use crate::core::runner::runner_for;
 use crate::core::scan::scan;
 use crate::ctx::Ctx;
-use crate::output::Mode;
+use crate::output::{Mode, count_label};
 use crate::rules::{self, Rule};
 use crate::safety::journal::Journal;
 use crate::safety::whitelist::Whitelist;
@@ -113,7 +113,12 @@ fn run_interactive(ctx: &Ctx, dry_run_flag: bool) -> anyhow::Result<OptimizeOutp
     }
 
     let mut terminal = tui::init_terminal()?;
-    let selection_result = drive_selection(&mut terminal, groups.clone());
+    let selection_result = drive_selection(
+        &mut terminal,
+        groups.clone(),
+        tui::confirm::Verb::Run,
+        dry_run_flag,
+    );
     // Leave the alternate screen before anything else happens: a sudo
     // prompt (during execution below) and the final summary (printed by our
     // caller once we return) both need a normal, scrollable terminal.
@@ -177,12 +182,15 @@ fn render_after_selection(
 
     let (ran, skipped, notes) = summarize_run(journal, &run_id)?;
     let mut out = if dry_run {
-        format!("Would run {ran} task(s) — dry run — nothing executed (recorded in history).")
+        format!(
+            "Would run {} · dry run — nothing executed (recorded in history)",
+            count_label(ran, "task")
+        )
     } else {
-        format!("Ran {ran} task(s).")
+        format!("Ran {}", count_label(ran, "task"))
     };
     if skipped > 0 {
-        out.push_str(&format!(" {skipped} skipped."));
+        out.push_str(&format!(" · {skipped} skipped"));
     }
 
     for note in notes {
@@ -190,30 +198,6 @@ fn render_after_selection(
     }
 
     Ok(OptimizeOutput { rendered: out })
-}
-
-/// Reads this run's journal records once and classifies all of them: how
-/// many actually ran (or, in a dry run, would have), how many were skipped
-/// (sudo in a sandbox), and "note: <rule> — <outcome>" lines for the
-/// skipped/error/refused ones (same format as `commands::shared::
-/// execution_notes`, inlined here so both counts and notes come from a
-/// single journal read instead of two).
-fn summarize_run(journal: &Journal, run_id: &str) -> anyhow::Result<(usize, usize, Vec<String>)> {
-    let (records, _) = journal.read_all()?;
-    let mut ran = 0;
-    let mut skipped = 0;
-    let mut notes = Vec::new();
-    for record in records.iter().filter(|r| r.run_id == run_id) {
-        if record.outcome.starts_with("skipped") {
-            skipped += 1;
-            notes.push(format!("note: {} — {}", record.rule, record.outcome));
-        } else if record.outcome.starts_with("error") || record.outcome.starts_with("refused") {
-            notes.push(format!("note: {} — {}", record.rule, record.outcome));
-        } else {
-            ran += 1;
-        }
-    }
-    Ok((ran, skipped, notes))
 }
 
 fn render_human(
@@ -235,13 +219,14 @@ fn render_human(
     }
     if is_dry_run {
         out.push_str(&format!(
-            "\n\nWould run {ran} task(s) (dry run — nothing was executed; recorded in history)."
+            "\n\nWould run {} · dry run — nothing executed (recorded in history)",
+            count_label(ran, "task")
         ));
     } else {
-        out.push_str(&format!("\n\nRan {ran} task(s)."));
+        out.push_str(&format!("\n\nRan {}", count_label(ran, "task")));
     }
     if skipped > 0 {
-        out.push_str(&format!(" {skipped} skipped."));
+        out.push_str(&format!(" · {skipped} skipped"));
     }
     out
 }
@@ -360,7 +345,7 @@ mod tests {
             "fstrim -av",
         );
         let out = render_human(&[g], true, true, 2, 1);
-        assert!(out.contains("Would run 2 task(s)"));
+        assert!(out.contains("Would run 2 tasks"));
         assert!(out.contains("dry run"));
         assert!(out.contains("1 skipped"));
     }
@@ -375,7 +360,7 @@ mod tests {
             "fstrim -av",
         );
         let out = render_human(&[g], true, false, 3, 0);
-        assert!(out.contains("Ran 3 task(s)."));
+        assert!(out.contains("Ran 3 tasks"));
         assert!(!out.contains("skipped"));
     }
 }
