@@ -107,12 +107,11 @@ fn duplicates(apps: &[AppEntry], packages: &[InstalledPackage]) -> Vec<Recommend
         }
         for (&member, &own_backend) in members.iter().zip(backends.iter()) {
             // distinct.len() >= 2 (checked above) and own_backend is itself
-            // one of distinct's members, so some other entry always exists.
-            let other_backend = distinct
-                .iter()
-                .copied()
-                .find(|&b| b != own_backend)
-                .expect("distinct has >= 2 backends, so one differs from own_backend");
+            // one of distinct's members, so some other entry always exists;
+            // if that invariant ever breaks, skip rather than panic.
+            let Some(other_backend) = distinct.iter().copied().find(|&b| b != own_backend) else {
+                continue;
+            };
             out.push(Recommendation {
                 package_index: apps[member].package_index,
                 kind: Kind::Duplicate { other_backend },
