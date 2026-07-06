@@ -34,7 +34,7 @@ fn fixture_ctx() -> (tempfile::TempDir, Ctx) {
 #[test]
 fn test_json_mode_is_rejected_as_non_interactive() {
     let (_sandbox, ctx) = fixture_ctx();
-    let err = uninstall::run(&ctx, false, Mode::Json).unwrap_err();
+    let err = uninstall::run(&ctx, false, Mode::Json, false).unwrap_err();
     assert!(err.to_string().contains("interactive terminal"));
 }
 

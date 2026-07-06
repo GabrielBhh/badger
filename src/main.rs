@@ -10,7 +10,7 @@ fn main() {
         // `uninstall`, `analyze`, and `status` have no `--yes` shortcut —
         // they're always attempting the interactive path unless mode/tty
         // checks inside them say otherwise.
-        Command::Uninstall | Command::Analyze { .. } | Command::Status { .. } => Some(false),
+        Command::Uninstall { .. } | Command::Analyze { .. } | Command::Status { .. } => Some(false),
         _ => None,
     };
     if let Some(yes) = yes

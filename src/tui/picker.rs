@@ -63,6 +63,22 @@ impl PickerState {
         state
     }
 
+    /// Like `new`, but starts in the Packages view even when apps exist
+    /// (`badger uninstall --packages`). Tab still toggles both ways at
+    /// runtime; with an empty apps list this is identical to `new`'s own
+    /// fallback (Packages view, no toggle advertised).
+    pub fn new_starting_with_packages(
+        items: Vec<InstalledPackage>,
+        apps: Vec<AppEntry>,
+    ) -> PickerState {
+        let mut state = PickerState::new(items, apps);
+        if state.view == View::Apps {
+            state.view = View::Packages;
+            state.recompute_filter();
+        }
+        state
+    }
+
     pub fn view(&self) -> View {
         self.view
     }
@@ -517,6 +533,28 @@ mod tests {
         state.toggle_view();
         assert_eq!(state.view(), View::Packages);
         assert!(!state.has_apps_view());
+    }
+
+    #[test]
+    fn test_new_starting_with_packages_overrides_the_apps_default() {
+        let mut state = PickerState::new_starting_with_packages(sample_items(), sample_apps());
+        assert_eq!(state.view(), View::Packages);
+        assert_eq!(state.visible().len(), 4);
+        // Tab must still toggle both ways at runtime.
+        assert!(state.has_apps_view());
+        state.toggle_view();
+        assert_eq!(state.view(), View::Apps);
+        state.toggle_view();
+        assert_eq!(state.view(), View::Packages);
+    }
+
+    #[test]
+    fn test_new_starting_with_packages_with_empty_apps_matches_the_plain_fallback() {
+        let mut state = PickerState::new_starting_with_packages(sample_items(), Vec::new());
+        assert_eq!(state.view(), View::Packages);
+        assert!(!state.has_apps_view());
+        state.toggle_view();
+        assert_eq!(state.view(), View::Packages, "toggle stays a no-op");
     }
 
     #[test]
