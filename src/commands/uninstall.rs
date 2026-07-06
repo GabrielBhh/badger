@@ -56,7 +56,7 @@ fn run_interactive(
         });
     }
 
-    eprintln!("reading applications…");
+    eprintln!("Reading applications...");
     let apps = crate::pkg::applications(ctx, &packages);
 
     let mut terminal = tui::init_terminal()?;

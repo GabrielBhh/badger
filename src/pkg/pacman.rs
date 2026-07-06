@@ -97,6 +97,8 @@ pub fn owners(ctx: &Ctx, files: &[PathBuf]) -> HashMap<PathBuf, String> {
     }
     let runner = runner_for(ctx);
     let mut argv = vec!["pacman".to_string(), "-Qo".to_string(), "--".to_string()];
+    // `display()` is lossy for non-UTF-8 paths, silently mangling those file
+    // names in the argv; acceptable since `.desktop` paths are ASCII in practice.
     argv.extend(files.iter().map(|f| f.display().to_string()));
     match runner.run(&argv) {
         Ok(out) => parse_owners(&out.stdout),
@@ -108,6 +110,9 @@ pub fn owners(ctx: &Ctx, files: &[PathBuf]) -> HashMap<PathBuf, String> {
 fn parse_owners(text: &str) -> HashMap<PathBuf, String> {
     text.lines()
         .filter_map(|line| {
+            // Splits on the first " is owned by "; a path containing that
+            // exact substring would misparse, but that requires a filename
+            // collision with pacman's own output phrasing to matter.
             let (path, rest) = line.split_once(" is owned by ")?;
             let pkg = rest.split_whitespace().next()?;
             Some((PathBuf::from(path.trim()), pkg.to_string()))

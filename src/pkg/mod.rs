@@ -82,7 +82,7 @@ pub struct AppEntry {
 /// `AppEntry`, keeping the shortest display name. Sorted by display name,
 /// case-insensitively.
 pub fn applications(ctx: &Ctx, packages: &[InstalledPackage]) -> Vec<AppEntry> {
-    let desktop_apps = desktop::scan(ctx);
+    let mut desktop_apps = desktop::scan(ctx);
 
     let flatpak_index: HashMap<&str, usize> = packages
         .iter()
@@ -106,6 +106,11 @@ pub fn applications(ctx: &Ctx, packages: &[InstalledPackage]) -> Vec<AppEntry> {
         .collect();
     pacman_files.sort();
     let owners = pacman::owners(ctx, &pacman_files);
+
+    // Sorted by desktop_file so that when two entries for the same package
+    // have equal-length display names, the fold below picks one consistently
+    // rather than depending on `read_dir`'s unspecified entry order.
+    desktop_apps.sort_by(|a, b| a.desktop_file.cmp(&b.desktop_file));
 
     let mut by_package: HashMap<usize, String> = HashMap::new();
     for app in &desktop_apps {
@@ -374,6 +379,44 @@ mod applications_tests {
         let apps = applications(&c, &packages);
         assert_eq!(apps.len(), 1);
         assert_eq!(apps[0].display_name, "Foo");
+    }
+
+    #[test]
+    fn test_applications_dedupe_tie_on_equal_length_names_is_deterministic_by_desktop_file_path() {
+        let f = fixture();
+        let dir = f.ctx.root.join("usr/share/applications");
+        // "Alfa" and "Zeta" are both 4 characters, so the shortest-name fold
+        // can't break the tie — only sorting desktop_apps by desktop_file
+        // path first makes the winner deterministic (aaa.desktop < bbb.desktop).
+        write_desktop(&dir, "bbb.desktop", "[Desktop Entry]\nName=Alfa\n");
+        write_desktop(&dir, "aaa.desktop", "[Desktop Entry]\nName=Zeta\n");
+        let bbb_file = dir.join("bbb.desktop");
+        let aaa_file = dir.join("aaa.desktop");
+        let mut c = f.ctx.clone();
+        let mut files = vec![
+            bbb_file.display().to_string(),
+            aaa_file.display().to_string(),
+        ];
+        files.sort();
+        let mut argv = vec!["pacman".to_string(), "-Qo".to_string(), "--".to_string()];
+        argv.extend(files);
+        c.fake_command_output = Some(HashMap::from([(
+            argv,
+            CmdOutput {
+                success: true,
+                stdout: format!(
+                    "{} is owned by foo 1.0-1\n{} is owned by foo 1.0-1\n",
+                    bbb_file.display(),
+                    aaa_file.display()
+                ),
+                stderr: String::new(),
+            },
+        )]));
+        let packages = vec![pacman_pkg("foo")];
+
+        let apps = applications(&c, &packages);
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].display_name, "Zeta", "aaa.desktop sorts first");
     }
 
     #[test]
